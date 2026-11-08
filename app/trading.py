@@ -18,6 +18,13 @@ SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,23}$")
 STOCK_SYMBOL_RE = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z]{1,4})?$")
 ADDRESS_RE = re.compile(r"^[A-Za-z0-9:_-]{1,160}$")
 _scan_lock = asyncio.Lock()
+STOCK_CACHE_TTL = timedelta(hours=6)
+
+
+def _stock_cache_is_fresh(observed_at: Any, now: datetime | None = None) -> bool:
+    observed = db.parse_timestamp(observed_at)
+    now = now or datetime.now(timezone.utc)
+    return observed is not None and timedelta(0) <= now - observed < STOCK_CACHE_TTL
 
 
 def token_key(chain: str, address: str) -> tuple[str, str]:
@@ -87,13 +94,33 @@ def dashboard() -> dict[str, Any]:
         result["agents"] = [dict(row) for row in conn.execute("SELECT id,name,status,detail FROM agents ORDER BY rowid")]
         result["candidates"] = []
         mode = result["settings"]["market_mode"]
-        for row in conn.execute("SELECT symbol,chain,pair_address,price_usd,liquidity_usd,volume_24h,price_change_24h,volume_spike_ratio,pair_created_at,risk_status,reason,url,observed_at,asset_type,source,quote_date,stock_volume_shares,stock_change_percent FROM candidates WHERE (?='both' OR asset_type=?) ORDER BY id", (mode, "stock" if mode == "stocks" else "crypto")):
+        for row in conn.execute("SELECT symbol,chain,pair_address,price_usd,liquidity_usd,volume_24h,price_change_24h,volume_spike_ratio,pair_created_at,risk_status,reason,url,observed_at,asset_type,source,quote_date,stock_volume_shares,stock_change_percent,cache_status FROM candidates WHERE (?='both' OR asset_type=?) ORDER BY id", (mode, "stock" if mode == "stocks" else "crypto")):
             item = dict(row)
             if item["asset_type"] == "stock":
+                if item["symbol"] not in result["settings"]["stock_symbols"]:
+                    continue
                 item["chain"] = item["pair_address"] = None
+                item["cache_status"] = (item["cache_status"] if item["cache_status"] in ("fresh", "cached") else "cached") if _stock_cache_is_fresh(item["observed_at"]) else "stale"
+            else:
+                item["cache_status"] = None
             for k in ("price_usd", "liquidity_usd", "volume_24h", "price_change_24h", "volume_spike_ratio", "stock_change_percent"):
                 item[k] = _f(item[k])
             result["candidates"].append(item)
+        if mode in ("stocks", "both"):
+            # Manual imports are separate from scanned candidates and provider cache;
+            # never feed them to the scanner, automatic orders, or position marks.
+            for row in conn.execute("SELECT symbol,price_usd,quote_date,stock_volume_shares,observed_at FROM manual_stock_quotes ORDER BY rowid"):
+                result["candidates"].append({
+                    "symbol": row["symbol"], "chain": None, "pair_address": None,
+                    "price_usd": _f(row["price_usd"]), "liquidity_usd": None, "volume_24h": None,
+                    "price_change_24h": None, "volume_spike_ratio": None, "pair_created_at": None,
+                    "risk_status": "manual only",
+                    "reason": "User-provided Yahoo Finance import, not independently verified; US listing and USD are assumed. Quote date is optional and user-supplied; the import time is not the quote time. Price and volume may be stale or incomplete. Manual paper trading only; no automatic buy, position mark, liquidity check, or risk assessment.",
+                    "url": None, "observed_at": row["observed_at"], "asset_type": "stock",
+                    "source": "User import (Yahoo Finance)", "quote_date": row["quote_date"],
+                    "stock_volume_shares": row["stock_volume_shares"], "stock_change_percent": None,
+                    "cache_status": "manual",
+                })
         result["trades"] = []
         for row in conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 250"):
             item = dict(row)
@@ -116,6 +143,12 @@ def update_settings(patch: dict[str, Any]) -> dict[str, Any]:
         settings.update(patch)
         import json
         conn.execute("UPDATE settings SET data=? WHERE id=1", (json.dumps(settings, allow_nan=False),))
+        if "stock_symbols" in patch:
+            # Removal is immediate and irreversible from the local cache: adding the
+            # ticker again requires another provider quote, not a revived old price.
+            placeholders = ",".join("?" for _ in settings["stock_symbols"])
+            conn.execute(f"DELETE FROM stock_quote_cache WHERE symbol NOT IN ({placeholders})", settings["stock_symbols"])
+            conn.execute(f"DELETE FROM candidates WHERE asset_type='stock' AND symbol NOT IN ({placeholders})", settings["stock_symbols"])
         if "starting_balance" in patch:
             db.snapshot(conn)
         db.log(conn, "settings", "Settings updated: " + ", ".join(sorted(patch)))
@@ -247,7 +280,7 @@ def _candidate(pair: dict[str, Any], settings: dict[str, Any], observed: str) ->
         "reason": "; ".join(reasons) if reasons else "Meets liquidity and volume thresholds; not a safety or rug-pull assessment.",
         "url": _url(pair.get("url")), "observed_at": observed,
         "asset_type": "crypto", "source": "DexScreener", "quote_date": None,
-        "stock_volume_shares": None, "stock_change_percent": None}
+        "stock_volume_shares": None, "stock_change_percent": None, "cache_status": None}
 
 
 async def _scan_crypto(settings: dict[str, Any]) -> tuple[list[dict], int]:
@@ -319,68 +352,171 @@ def _stock_candidate(payload: Any, symbol: str, observed: str) -> dict | None:
             "reason": "Stock quote for manual paper trades only; end-of-day historical data, no liquidity or risk assessment. USD assumed for US-listed stocks; currency is not guaranteed by the provider.",
             "url": None, "observed_at": observed, "asset_type": "stock", "source": "Alpha Vantage",
             "quote_date": quote_date, "stock_volume_shares": int(volume),
-            "stock_change_percent": str(change) if change is not None else None}
+            "stock_change_percent": str(change) if change is not None else None, "cache_status": "fresh"}
+
+
+def _classify_stock_notice(value: Any) -> str:
+    """Classify locally; never return or log provider text (which may contain a key)."""
+    text = value.lower() if isinstance(value, str) else ""
+    key = r"(?:api[ _-]?key|apikey)"
+    invalid = r"(?:invalid|incorrect|not valid|not a valid|unauthorized|revoked|missing)"
+    if re.search(rf"\b{invalid}(?:\s+or\s+{invalid})?\s+(?:your\s+)?{key}\b", text) or re.search(
+        rf"\b{key}(?:\s+(?:parameter|you provided|you supplied|provided|supplied|entered))?\s*(?:is|was|:)\s*{invalid}\b(?!\s+symbol)", text
+    ):
+        return "auth"
+    if (re.search(r"rate[ -]?limit|quota|too many requests|call frequency", text)
+        or re.search(r"(?:free|standard).{0,100}(?:requests?|calls?).{0,30}per (?:minute|hour|day)", text)):
+        return "quota"
+    if re.search(r"premium|entitlement|not entitled|subscription.{0,40}(?:required|need)|(?:requires?|need).{0,40}subscription|not available.{0,40}(?:plan|subscription)", text):
+        return "premium"
+    if re.search(r"(?:request|call).{0,40}(?:limit|exceed|reached)|(?:limit|exceed|reached).{0,40}(?:request|call)", text):
+        return "quota"
+    return "unknown"
+
+
+def _is_stock_symbol_error(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.lower()
+    problem = r"(?:invalid|unknown|unsupported|unrecognized|not found|no data|not supported|check)"
+    return bool(re.search(rf"{problem}.{{0,80}}(?:symbol|ticker)|(?:symbol|ticker).{{0,80}}{problem}", text))
+
+
+_STOCK_NOTICE_MESSAGES = {
+    "quota": "Alpha Vantage reported a request quota or rate limit. Retry manually when access is available; no reset time is assumed.",
+    "auth": "Alpha Vantage reported an invalid or missing API key. Check the configured market data key.",
+    "premium": "Alpha Vantage reported that the request requires different provider access or a premium entitlement. Check your plan.",
+    "unknown": "Alpha Vantage returned an unrecognized account or information notice. Check the provider account; its cause is unknown.",
+}
+
+
+def _cached_stock_candidate(row: Any) -> dict | None:
+    # Validate persisted values again, and never invent an observation time.
+    if db.parse_timestamp(row["observed_at"]) is None:
+        return None
+    change = row["stock_change_percent"]
+    payload = {"Global Quote": {"01. symbol": row["symbol"], "05. price": row["price_usd"],
+               "06. volume": row["stock_volume_shares"], "07. latest trading day": row["quote_date"],
+               "10. change percent": f"{change}%" if change is not None else None}}
+    item = _stock_candidate(payload, row["symbol"], row["observed_at"])
+    if item and change is not None and item["stock_change_percent"] is None:
+        return None
+    return item
 
 
 async def _scan_stocks(symbols: list[str]) -> tuple[list[dict], list[str]]:
-    warnings = []
-    candidates = []
-    try:
-        key = market_data.load_key()
-    except HTTPException:
-        return [], ["Alpha Vantage market key is unavailable or cannot be decrypted; check encryption configuration."]
-    if key is None:
-        if "IBM" in symbols:
-            warnings.append("Alpha Vantage demo key is used for IBM only; quotes are end-of-day historical, not real-time.")
-        for symbol in symbols:
-            if symbol != "IBM":
-                warnings.append(f"{symbol}: configure your own Alpha Vantage API key; the demo key is only available for IBM.")
-        symbols = [symbol for symbol in symbols if symbol == "IBM"]
-        key = "demo"
-    if not symbols:
-        return candidates, warnings
-    # One request per symbol, sequentially, no retries, capped total duration.
-    deadline = asyncio.get_running_loop().time() + 30
-    async with httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False,
-                                 headers={"Accept": "application/json", "User-Agent": "LocalPaperLedger/1.0"}) as client:
-        for index, symbol in enumerate(symbols):
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                warnings.extend(f"{s}: skipped after stock scan time limit." for s in symbols[index:])
-                break
-            try:
-                response = await asyncio.wait_for(client.get("https://www.alphavantage.co/query", params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": key}), timeout=remaining)
-                response.raise_for_status()
-                payload = response.json()
-                if isinstance(payload, dict) and ("Note" in payload or "Information" in payload):
-                    warnings.append(f"{symbol}: Alpha Vantage returned a quota or information notice; no quote available.")
-                    warnings.extend(f"{s}: skipped after provider notice to avoid further requests." for s in symbols[index + 1:])
-                    break
-                if isinstance(payload, dict) and "Error Message" in payload:
-                    warnings.append(f"{symbol}: Alpha Vantage rejected the symbol or request.")
-                    continue
-                item = _stock_candidate(payload, symbol, db.utc_now())
-                if item is None:
-                    warnings.append(f"{symbol}: Alpha Vantage returned an empty or invalid quote.")
-                else:
-                    candidates.append(item)
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code
-                warnings.append(f"{symbol}: Alpha Vantage returned HTTP {status}.")
-                if status == 429:
-                    warnings.extend(f"{s}: skipped after rate limit to avoid further requests." for s in symbols[index + 1:])
-                    break
-            except (asyncio.TimeoutError, httpx.TimeoutException):
-                warnings.append(f"{symbol}: Alpha Vantage request timed out.")
-            except Exception:
-                # Never include exception details, upstream bodies, or query URLs.
-                warnings.append(f"{symbol}: Alpha Vantage request failed or returned invalid data.")
+    warnings: list[str] = []
+    results: dict[str, dict] = {}
+    cache: dict[str, dict] = {}
+    with db.read_connection() as conn:
+        for symbol, row in db.get_stock_quote_cache(conn, provider=db.ALPHA_VANTAGE_QUOTE_CACHE, symbols=symbols).items():
+            item = _cached_stock_candidate(row)
+            if item:
+                cache[symbol] = item
+    now = datetime.now(timezone.utc)
+    pending = []
+    for symbol in symbols:
+        item = cache.get(symbol)
+        if item and _stock_cache_is_fresh(item["observed_at"], now):
+            results[symbol] = {**item, "cache_status": "cached"}
+        else:
+            pending.append(symbol)
+
+    if pending:
+        try:
+            key = market_data.load_key()
+        except HTTPException:
+            key = None
+            warnings.append("Alpha Vantage market key is unavailable or cannot be decrypted; check encryption configuration.")
+            warnings.extend(f"{symbol}: skipped because the market key is unavailable." for symbol in pending)
+            pending = []
+        else:
+            if key is None:
+                if "IBM" in pending:
+                    warnings.append("Alpha Vantage demo key is used for IBM only; quotes are end-of-day historical, not real-time.")
+                for symbol in pending:
+                    if symbol != "IBM":
+                        warnings.append(f"{symbol}: skipped; configure your own Alpha Vantage API key; the demo key is only available for IBM.")
+                pending = [symbol for symbol in pending if symbol == "IBM"]
+                key = "demo"
+        if pending:
+            # One request per missing/expired symbol, sequentially, no retries.
+            deadline = asyncio.get_running_loop().time() + 30
+            async with httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False,
+                                         headers={"Accept": "application/json", "User-Agent": "LocalPaperLedger/1.0"}) as client:
+                for index, symbol in enumerate(pending):
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        warnings.extend(f"{s}: skipped after stock scan time limit." for s in pending[index:])
+                        break
+                    stop = False
+                    try:
+                        response = await asyncio.wait_for(client.get("https://www.alphavantage.co/query", params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": key}), timeout=remaining)
+                        response.raise_for_status()
+                        payload = response.json()
+                        notice_key = next((k for k in ("Note", "Information") if isinstance(payload, dict) and k in payload), None)
+                        has_error = isinstance(payload, dict) and "Error Message" in payload
+                        error_message = payload.get("Error Message") if has_error else None
+                        kind = _classify_stock_notice(payload[notice_key] if notice_key else error_message)
+                        if notice_key or (has_error and (kind != "unknown" or not _is_stock_symbol_error(error_message))):
+                            warnings.append(f"{symbol}: {_STOCK_NOTICE_MESSAGES[kind]}")
+                            stop = True
+                        elif has_error:
+                            warnings.append(f"{symbol}: Alpha Vantage rejected the symbol or request.")
+                        else:
+                            item = _stock_candidate(payload, symbol, db.utc_now())
+                            if item is None:
+                                warnings.append(f"{symbol}: Alpha Vantage returned an empty or invalid quote.")
+                            else:
+                                results[symbol] = item
+                    except httpx.HTTPStatusError as exc:
+                        status = exc.response.status_code
+                        if status == 429:
+                            warnings.append(f"{symbol}: {_STOCK_NOTICE_MESSAGES['quota']} (HTTP 429.)")
+                            stop = True
+                        else:
+                            try:
+                                body = exc.response.json()
+                            except (ValueError, TypeError):
+                                body = None
+                            notice_key = next((k for k in ("Note", "Information", "Error Message") if isinstance(body, dict) and k in body), None)
+                            notice = body[notice_key] if notice_key else None
+                            kind = _classify_stock_notice(notice)
+                            if notice_key and (notice_key != "Error Message" or kind != "unknown" or not _is_stock_symbol_error(notice)):
+                                warnings.append(f"{symbol}: {_STOCK_NOTICE_MESSAGES[kind]} (HTTP {status}.)")
+                                stop = True
+                            elif status in (401, 403):
+                                # An authorization status alone does not establish an invalid key.
+                                warnings.append(f"{symbol}: Alpha Vantage refused the request (HTTP {status}); check provider account access.")
+                                stop = True
+                            else:
+                                warnings.append(f"{symbol}: Alpha Vantage returned HTTP {status}.")
+                                stop = 300 <= status < 400
+                    except (asyncio.TimeoutError, httpx.TimeoutException):
+                        warnings.append(f"{symbol}: Alpha Vantage request timed out.")
+                    except Exception:
+                        # Never include exception details, upstream bodies, or query URLs.
+                        warnings.append(f"{symbol}: Alpha Vantage request failed or returned invalid data.")
+                    if stop:
+                        warnings.extend(f"{s}: skipped after provider notice to avoid further requests." for s in pending[index + 1:])
+                        break
+
+    for symbol in symbols:
+        if symbol not in results and symbol in cache:
+            results[symbol] = {**cache[symbol], "cache_status": "stale"}
+            warnings.append(f"{symbol}: showing a stale cached stock quote; the original observation time is retained and the quote was not refreshed.")
+        elif symbol in results and results[symbol]["cache_status"] == "cached" and not _stock_cache_is_fresh(results[symbol]["observed_at"]):
+            results[symbol]["cache_status"] = "stale"
+            warnings.append(f"{symbol}: the cached stock quote expired during this scan; the original observation time is retained.")
+    candidates = [results[symbol] for symbol in symbols if symbol in results]
+    if candidates and not any(item["cache_status"] == "fresh" for item in candidates):
+        warnings.append("Only cached stock quotes are available; no new stock quotes were fetched in this scan. Check each cache status and observation time.")
     return candidates, warnings
 
 
 _CANDIDATE_FIELDS = ("symbol", "chain", "pair_address", "price_usd", "liquidity_usd", "volume_24h",
     "price_change_24h", "volume_spike_ratio", "pair_created_at", "risk_status", "reason", "url",
-    "observed_at", "asset_type", "source", "quote_date", "stock_volume_shares", "stock_change_percent")
+    "observed_at", "asset_type", "source", "quote_date", "stock_volume_shares", "stock_change_percent", "cache_status")
 _DECIMAL_CANDIDATE_FIELDS = ("price_usd", "liquidity_usd", "volume_24h", "price_change_24h", "volume_spike_ratio", "stock_change_percent")
 
 
@@ -421,6 +557,8 @@ async def scan_market() -> dict[str, Any]:
             else:
                 conn.execute("DELETE FROM candidates")
                 for item in candidates:
+                    if item["asset_type"] == "stock" and item["cache_status"] == "fresh":
+                        db.put_stock_quote_cache(conn, provider=db.ALPHA_VANTAGE_QUOTE_CACHE, item=item)
                     # Legacy chain/pair columns are NOT NULL. Empty storage values are
                     # represented as null in the API for stock rows.
                     values = [item[k] if k not in ("chain", "pair_address") else item[k] or "" for k in _CANDIDATE_FIELDS]

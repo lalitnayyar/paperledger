@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
-from app import db, trading
+from app import db, trading, yahoo_quotes
 from app.llm import router as llm_router
 from app.market_data import router as market_data_router
 
@@ -26,7 +26,50 @@ async def lifespan(app: FastAPI):
     yield
 
 
+# JSON may escape each CSV byte as up to six ASCII characters (e.g. \u0000).
+# Leave modest envelope space while bounding input before Pydantic parses it.
+STOCK_IMPORT_MAX_REQUEST_BYTES = 6 * yahoo_quotes.MAX_IMPORT_BYTES + 1024
+
+
+class StockImportBodyLimitMiddleware:
+    """Limit this request's streamed body without trusting Content-Length."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] != "/api/stock-import" or scope["method"] != "POST":
+            await self.app(scope, receive, send)
+            return
+        chunks, size = [], 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            size += len(chunk)
+            if size > STOCK_IMPORT_MAX_REQUEST_BYTES:
+                response = JSONResponse(status_code=422, content={"detail": "CSV request exceeds the size limit."}, headers={"Cache-Control": "no-store"})
+                await response(scope, receive, send)
+                return
+            if chunk:
+                chunks.append(chunk)
+            if not message.get("more_body", False):
+                break
+        body = b"".join(chunks)
+        delivered = False
+
+        async def replay():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
 app = FastAPI(title="TradeLedger Paper Trading", lifespan=lifespan)
+app.add_middleware(StockImportBodyLimitMiddleware)
 app.include_router(llm_router)
 app.include_router(market_data_router)
 
@@ -55,6 +98,9 @@ async def local_origin_policy(request: Request, call_next):
 @app.exception_handler(RequestValidationError)
 async def validation_error(request: Request, exc: RequestValidationError):
     # Never echo raw inputs (NaN/Infinity also break JSON encoding and could leak secrets).
+    if request.url.path == "/api/stock-import":
+        # Unknown field names and validation locations may themselves contain user data.
+        return JSONResponse(status_code=422, content={"detail": "Provide a CSV string within the import size limit."})
     errors = [{"loc": list(item.get("loc", ())), "msg": item.get("msg", "Invalid input"), "type": item.get("type", "value_error")} for item in exc.errors()]
     return JSONResponse(status_code=422, content={"detail": errors})
 
@@ -76,7 +122,7 @@ class SettingsUpdate(StrictModel):
     auto_paper: StrictBool | None = None
     scan_interval_seconds: int | None = Field(default=None, ge=10, le=86400, strict=True)
     market_mode: Literal["crypto", "stocks", "both"] | None = None
-    stock_symbols: list[str] | None = Field(default=None, min_length=1, max_length=20)
+    stock_symbols: list[str] | None = Field(default=None, min_length=1, max_length=25)
 
     @field_validator("stock_symbols", mode="before")
     @classmethod
@@ -96,6 +142,22 @@ class SettingsUpdate(StrictModel):
         if len(set(symbols)) != len(symbols):
             raise ValueError("Stock symbols must not contain duplicates")
         return symbols
+
+
+class StockImport(StrictModel):
+    # Match the parser's limit in both characters and UTF-8 bytes. No coercion.
+    csv: str = Field(strict=True, max_length=yahoo_quotes.MAX_IMPORT_BYTES)
+
+    @field_validator("csv")
+    @classmethod
+    def bounded_utf8_csv(cls, value: str) -> str:
+        try:
+            size = len(value.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ValueError("CSV must be valid UTF-8.") from None
+        if size > yahoo_quotes.MAX_IMPORT_BYTES:
+            raise ValueError("Import exceeds the size limit.")
+        return value
 
 
 class ManualTrade(StrictModel):
@@ -162,7 +224,8 @@ def health():
 def dashboard():
     data = trading.dashboard()
     data["disclosures"] = {
-        "market_data": "DexScreener shows recently profiled tokens, not necessarily new pairs. Alpha Vantage GLOBAL_QUOTE is end-of-day historical data, not real-time: quote_date is its trading date, stock_volume_shares is shares, and stock_change_percent is close-to-close. Enter US-listed USD stocks only; the provider does not guarantee currency or verify US listing. With no key, the demo is available only for IBM. Each stock symbol uses one request; the free tier generally permits 25 requests per day, subject to provider limits. Stock quotes are manual paper trades only and do not update marks. All data may be stale; check dates and observation times.",
+        "market_data": "DexScreener shows recently profiled tokens, not necessarily new pairs. Alpha Vantage GLOBAL_QUOTE is end-of-day historical data, not real-time: quote_date is its trading date, stock_volume_shares is shares, and stock_change_percent is close-to-close. Enter US-listed USD stocks only; the provider does not guarantee currency or verify US listing. With no key, the demo is available only for IBM. Manual scans reuse stock quotes for six hours and request only missing or expired symbols, subject to provider limits; stale cached quotes may be shown when refresh fails. Stock quotes are manual paper trades only and do not update marks. Check cache status, trading dates and original observation times.",
+        "manual_import": "Yahoo Finance imports are user-provided, not independently verified, and may be stale. The quote date is optional and user-supplied; the recorded import time is not the quote time. USD and US listing are assumed, not verified. Manual paper trading only: imports never trigger automatic buys or position marks.",
         "risk": "Basic price, liquidity and volume checks do not detect scams, honeypots, rug pulls, or ensure safety.",
         "marks": "Unmarked positions make total equity and total unrealized P&L unavailable. Entry price includes allocated buy fees.",
         "orders": "Paper simulation only; no live orders. No automated stop-loss or take-profit execution; stop is a sizing assumption and take-profit is advisory.",
@@ -170,6 +233,19 @@ def dashboard():
         "closed_trades": "Closed trades and win rate count individual sell executions, including partial sells.",
     }
     return data
+
+
+@app.post("/api/stock-import")
+def stock_import(payload: StockImport):
+    candidates, warnings = yahoo_quotes.import_quotes(payload.csv)
+    if not candidates:
+        # Parser warnings are fixed/sanitized; omit the general disclosure and
+        # report one brief reason without exposing the CSV or rejected values.
+        reason = warnings[-1] if len(warnings) > 1 else "No valid quote rows were supplied."
+        raise HTTPException(422, f"No quotes imported. {reason}")
+    db.replace_manual_stock_quotes(candidates)
+    warnings.append("Quote dates are optional and user-supplied; import time is not quote time. Manual paper trading only; no automatic buys or position marks.")
+    return {"imported": len(candidates), "warnings": warnings}
 
 
 @app.put("/api/settings")

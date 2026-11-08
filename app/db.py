@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -66,6 +67,10 @@ CREATE TABLE IF NOT EXISTS candidates (
  risk_status TEXT NOT NULL, reason TEXT NOT NULL, url TEXT,
  observed_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS manual_stock_quotes (
+ symbol TEXT NOT NULL PRIMARY KEY, price_usd TEXT NOT NULL, quote_date TEXT,
+ stock_volume_shares INTEGER, observed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS agents (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL
 );
@@ -73,10 +78,22 @@ CREATE TABLE IF NOT EXISTS agents (
 
 _init_lock = threading.Lock()
 _initialized_paths: set[str] = set()
+ALPHA_VANTAGE_QUOTE_CACHE = "alpha_vantage:global_quote"
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    """Parse only timezone-aware ISO timestamps; never guess a missing timezone."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc) if parsed.utcoffset() is not None else None
+    except (ValueError, OverflowError):
+        return None
 
 
 def clean_text(value: Any, limit: int = 300) -> str:
@@ -110,13 +127,50 @@ def init_db() -> None:
             "asset_type": "TEXT NOT NULL DEFAULT 'crypto'",
             "source": "TEXT NOT NULL DEFAULT 'DexScreener'",
             "quote_date": "TEXT", "stock_volume_shares": "INTEGER",
-            "stock_change_percent": "TEXT",
+            "stock_change_percent": "TEXT", "cache_status": "TEXT",
         }
         for name, column_type in migrations.items():
             if name not in candidate_columns:
                 conn.execute(f"ALTER TABLE candidates ADD COLUMN {name} {column_type}")
+        cache_existed = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stock_quote_cache'").fetchone() is not None
+        old_cache = cache_existed and "provider" not in {row[1] for row in conn.execute("PRAGMA table_info(stock_quote_cache)")}
+        if old_cache:
+            conn.execute("ALTER TABLE stock_quote_cache RENAME TO stock_quote_cache_legacy")
+        conn.execute("""CREATE TABLE IF NOT EXISTS stock_quote_cache (
+            provider TEXT NOT NULL, symbol TEXT NOT NULL, price_usd TEXT NOT NULL, quote_date TEXT,
+            stock_volume_shares INTEGER, stock_change_percent TEXT, observed_at TEXT NOT NULL,
+            PRIMARY KEY(provider, symbol)
+        )""")
+        if old_cache:
+            conn.execute("""INSERT INTO stock_quote_cache(provider,symbol,price_usd,quote_date,stock_volume_shares,stock_change_percent,observed_at)
+                SELECT ?,symbol,price_usd,quote_date,stock_volume_shares,stock_change_percent,observed_at FROM stock_quote_cache_legacy""",
+                (ALPHA_VANTAGE_QUOTE_CACHE,))
+            conn.execute("DROP TABLE stock_quote_cache_legacy")
         created = conn.execute("INSERT OR IGNORE INTO settings(id, data) VALUES (1, ?)", (json.dumps(DEFAULT_SETTINGS),)).rowcount
         conn.execute("INSERT OR IGNORE INTO account(id, cash) VALUES (1, ?)", (str(DEFAULT_SETTINGS["starting_balance"]),))
+        if not cache_existed:
+            # Seed once, only from valid Alpha Vantage candidate records for the
+            # current watchlist. Preserve the actual observation time, even if old.
+            watched = set(get_settings(conn)["stock_symbols"])
+            now = datetime.now(timezone.utc)
+            for row in conn.execute("SELECT * FROM candidates WHERE asset_type='stock' AND source='Alpha Vantage' ORDER BY id DESC"):
+                try:
+                    symbol, observed = row["symbol"], parse_timestamp(row["observed_at"])
+                    price, volume = Decimal(str(row["price_usd"])), Decimal(str(row["stock_volume_shares"]))
+                    day = row["quote_date"]
+                    change = Decimal(str(row["stock_change_percent"])) if row["stock_change_percent"] is not None else None
+                    valid_number = lambda n: n.is_finite() and abs(n) <= Decimal("1e18") and n.as_tuple().exponent >= -18
+                    if (symbol not in watched or not re.fullmatch(r"[A-Z]{1,5}(?:[.-][A-Z]{1,4})?", symbol)
+                        or observed is None or observed > now or not isinstance(day, str)
+                        or date.fromisoformat(day).isoformat() != day or not valid_number(price) or price <= 0
+                        or not valid_number(volume) or volume < 0 or volume != volume.to_integral_value()
+                        or (change is not None and not valid_number(change))):
+                        continue
+                    conn.execute("INSERT OR IGNORE INTO stock_quote_cache VALUES (?,?,?,?,?,?,?)",
+                                 (ALPHA_VANTAGE_QUOTE_CACHE, symbol, str(price), day, int(volume), str(change) if change is not None else None, row["observed_at"]))
+                except (ValueError, TypeError, InvalidOperation, OverflowError):
+                    continue
+            conn.execute("UPDATE candidates SET cache_status='cached' WHERE asset_type='stock' AND source='Alpha Vantage' AND cache_status IS NULL")
         for agent_id, (name, status, detail) in AGENTS.items():
             conn.execute("INSERT OR IGNORE INTO agents(id,name,status,detail) VALUES (?,?,?,?)", (agent_id, name, status, detail))
         if created:
@@ -175,6 +229,39 @@ def get_settings(conn: sqlite3.Connection) -> dict[str, Any]:
     if row is None:
         raise RuntimeError("Database has not been initialized")
     return {**DEFAULT_SETTINGS, **json.loads(row[0])}
+
+
+def replace_manual_stock_quotes(items: list[dict[str, Any]]) -> None:
+    """Atomically replace a nonempty parser-validated import; never store CSV or JSON."""
+    if not items:
+        raise ValueError("Cannot replace manual quotes with an empty import.")
+    with transaction() as conn:
+        conn.execute("DELETE FROM manual_stock_quotes")
+        conn.executemany(
+            "INSERT INTO manual_stock_quotes(symbol,price_usd,quote_date,stock_volume_shares,observed_at) VALUES (?,?,?,?,?)",
+            [(item["symbol"], item["price_usd"], item["quote_date"], item["stock_volume_shares"], item["observed_at"]) for item in items],
+        )
+        log(conn, "scanner", f"Manual stock import replaced: {len(items)} quote(s).")
+
+
+def get_stock_quote_cache(conn: sqlite3.Connection, *, provider: str, symbols: list[str]) -> dict[str, sqlite3.Row]:
+    """Read raw quotes from one provider/endpoint namespace; adapters validate them."""
+    if not symbols:
+        return {}
+    placeholders = ",".join("?" for _ in symbols)
+    return {row["symbol"]: row for row in conn.execute(
+        f"SELECT * FROM stock_quote_cache WHERE provider=? AND symbol IN ({placeholders})", (provider, *symbols))}
+
+
+def put_stock_quote_cache(conn: sqlite3.Connection, *, provider: str, item: dict[str, Any]) -> None:
+    """Upsert a validated quote in an explicit namespace, within the caller's transaction."""
+    conn.execute("""INSERT INTO stock_quote_cache(provider,symbol,price_usd,quote_date,stock_volume_shares,stock_change_percent,observed_at)
+        VALUES (?,?,?,?,?,?,?) ON CONFLICT(provider,symbol) DO UPDATE SET
+        price_usd=excluded.price_usd,quote_date=excluded.quote_date,
+        stock_volume_shares=excluded.stock_volume_shares,stock_change_percent=excluded.stock_change_percent,
+        observed_at=excluded.observed_at""",
+        (provider, item["symbol"], item["price_usd"], item.get("quote_date"), item.get("stock_volume_shares"),
+         item.get("stock_change_percent"), item["observed_at"]))
 
 
 def set_agent(conn: sqlite3.Connection, agent_id: str, status: str, detail: str) -> None:

@@ -117,7 +117,25 @@ The menu's backups are stored under `backups/` with restricted permissions where
 
 Use the market selector on the dashboard to choose **Stocks**, **Crypto**, or **Both**, select **Save selection**, then select **Run scanner**. The choice is saved. Crypto uses recently profiled DEX Screener tokens; its liquidity and volume checks are not a contract audit. Stock results come from a configurable list of US-listed, USD-priced symbols using Alpha Vantage's `GLOBAL_QUOTE` endpoint. A stock result includes its latest trading day and trading volume in shares, not token liquidity or 24-hour dollar volume.
 
-The default stock watchlist contains `IBM`, which can be tested with the provider's public demo key. To scan your own symbols, obtain an [Alpha Vantage API key](https://www.alphavantage.co/support/#api-key), add it in **Settings**, and edit the stock watchlist. The service is rate-limited: each symbol uses one API request per scan, and Alpha Vantage currently documents 25 requests per day on its standard free tier for most datasets; check the provider for current limits and terms. If one source is unavailable in **Both** mode, review any warnings and the observation dates rather than assuming both scans succeeded.
+The default stock watchlist contains `IBM`, which can be tested with the provider's public demo key. To scan your own symbols, obtain an [Alpha Vantage API key](https://www.alphavantage.co/support/#api-key), add it in **Settings**, and edit the stock watchlist (up to 25 symbols). The service is rate-limited: each uncached symbol can use one API request, and Alpha Vantage currently documents 25 requests per day on its standard free tier for most datasets; check the provider for current limits and terms. If one source is unavailable in **Both** mode, review any warnings and the observation dates rather than assuming both scans succeeded.
+
+To reduce repeat calls, the app caches successful stock quotes for six hours and keeps older cached quotes if a later request fails. Cached results are labeled with their original fetch time and trading day. The cache cannot bypass an exhausted quota or a provider outage. If the provider reports a limit, wait for the provider's limit to reset before manually scanning again, or reduce the watchlist; the app does not retry in the background. A saved key does not prove that a provider accepted every request.
+
+### Manually import Yahoo Finance quotes
+
+In **Settings → Import Yahoo Finance quotes**, paste up to 25 stock quotes that you are authorized to use. The app does not automatically connect to Yahoo Finance: [Yahoo's terms](https://legal.yahoo.com/us/en/yahoo/terms/otos/index.html) restrict automated data collection without its prior express permission. Yahoo says its [market data](https://help.yahoo.com/kb/SLN2310.html) is informational, not intended for trading or investing, and must not be redistributed. Check the applicable terms before importing any data.
+
+![Manual stock quote import panel](docs/screenshots/manual-import.png)
+
+Use a CSV header and one row per stock. These example prices are illustrative, not market quotes:
+
+```csv
+symbol,price,date,volume
+AAPL,189.15,2026-11-06,100000
+MSFT,420.00,,
+```
+
+Date and volume are optional. User-imported quotes are not independently verified and can be stale; the import time is not the quote time. Verify the price and any supplied date before using a quote. Imported quotes are displayed alongside scanner results in Stocks or Both mode, persist across scans and restarts, and never trigger stock buys or automatic marks. A new successful import replaces the previous imported set.
 
 Alpha Vantage's default quote is historical/end-of-day, **not a live price**. Market closures, provider updates, or network problems can make it older. Check the quote date before using it. A stock quote can prefill a manual paper order, but it is never submitted without your action and is not automatically used to buy or mark a stock holding. No scan runs in the background.
 
