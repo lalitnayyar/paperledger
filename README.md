@@ -18,6 +18,12 @@ These screenshots were captured from the application in a sandbox. The example b
 
 ![PaperLedger dashboard showing paper portfolio, workflow stages, equity history and scanner](docs/screenshots/dashboard.png)
 
+### Animated agent flow
+
+![Animated guide showing the six paper-trading workflow stages](docs/screenshots/agent-flow.gif)
+
+The agent-flow panel is an illustrative visual guide, not an indication of active trading or live agent execution. Use its **Animation** button to pause or resume the decoration. It automatically respects your system's reduced-motion setting; pausing it does not start or stop the scanner or paper cycle. The separate agent network shows the engine's reported status.
+
 ### Stock and crypto ledger
 
 ![Paper ledger showing an example stock quote prefilled for manual review](docs/screenshots/ledger.png)

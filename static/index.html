@@ -6,8 +6,10 @@
   <meta name="color-scheme" content="dark light">
   <title>Ledger / Six — Paper trading workspace</title>
   <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/motion.css">
   <script>try{document.documentElement.dataset.theme=localStorage.getItem('ledger-six-theme')==='light'?'light':'dark'}catch(e){}</script>
   <script src="/static/app.js" defer></script>
+  <script src="/static/motion.js" defer></script>
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" class="svg-sprite" aria-hidden="true">
@@ -53,6 +55,22 @@
             <article class="metric-card"><div class="metric-top"><span>REALIZED P&amp;L</span><span class="metric-number">03</span></div><div class="metric-value" id="metric-realized">—</div><div class="metric-caption">From closed trades</div></article>
             <article class="metric-card"><div class="metric-top"><span>OPEN POSITIONS</span><span class="metric-number">04</span></div><div class="metric-value" id="metric-positions">—</div><div class="metric-caption" id="metric-unrealized">Unrealized P&amp;L: —</div></article>
           </div>
+          <section class="panel flow-panel" aria-labelledby="flow-title">
+            <div class="flow-head">
+              <div><div class="kicker">THE PROCESS <span>/ VISUAL GUIDE</span></div><h2 id="flow-title">Agent flow</h2><p>Illustrative animation · not live execution</p></div>
+              <button class="flow-toggle" id="flow-motion-toggle" type="button" aria-describedby="flow-motion-help" aria-pressed="true" title="Pause animation"><span class="flow-toggle-mark" aria-hidden="true"></span><span>Animation <span class="flow-toggle-state" aria-hidden="true">on</span></span></button>
+              <span class="flow-sr-only" id="flow-motion-help">Press to pause or resume the decorative animation only; it does not run or stop a scanner or trade. Animation is off when your system prefers reduced motion.</span>
+            </div>
+            <ol class="flow-steps" aria-label="Illustrative agent flow steps">
+              <li class="flow-step"><span class="flow-link" aria-hidden="true"></span><span class="flow-signal flow-motion" aria-hidden="true"></span><span class="flow-orb"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="5"/><path d="m14 14 4 4M10 7.5v5M7.5 10h5"/></svg></span><strong>Scanner</strong><small>01 / DISCOVER</small></li>
+              <li class="flow-step"><span class="flow-link" aria-hidden="true"></span><span class="flow-signal flow-motion" aria-hidden="true"></span><span class="flow-orb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 7 3v5c0 5-3 8-7 10-4-2-7-5-7-10V6zM9 12l2 2 4-4"/></svg></span><strong>Risk check</strong><small>02 / REVIEW</small></li>
+              <li class="flow-step"><span class="flow-link" aria-hidden="true"></span><span class="flow-signal flow-motion" aria-hidden="true"></span><span class="flow-orb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 18h14M7 15V9M12 15V6M17 15v-4"/><circle cx="7" cy="8" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="17" cy="10" r="1"/></svg></span><strong>Sizer</strong><small>03 / SIZE</small></li>
+              <li class="flow-step"><span class="flow-link" aria-hidden="true"></span><span class="flow-signal flow-motion" aria-hidden="true"></span><span class="flow-orb"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="3"/><path d="M9 12h6M12 9v6"/></svg></span><strong>Paper executor</strong><small>04 / SIMULATE</small></li>
+              <li class="flow-step"><span class="flow-link" aria-hidden="true"></span><span class="flow-signal flow-motion" aria-hidden="true"></span><span class="flow-orb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v16H6zM9 8h6M9 12h6M9 16h4"/></svg></span><strong>Logger</strong><small>05 / RECORD</small></li>
+              <li class="flow-step"><span class="flow-orb"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19h16M5 16l4-4 3 2 6-7"/><circle cx="18" cy="7" r="1"/></svg></span><strong>Equity curve</strong><small>06 / VIEW</small></li>
+            </ol>
+            <div class="flow-note">A visual guide only <span>·</span> Scanner and cycle run by your action</div>
+          </section>
           <div class="dashboard-grid">
             <section class="panel chart-panel"><div class="panel-head"><div><div class="kicker">PERFORMANCE <span>/ 01</span></div><h2>Equity curve</h2><p>Recorded snapshots; an unmarked holding makes current equity unavailable.</p></div><span class="subtle-tag">ALL HISTORY</span></div><div class="chart-wrap"><svg id="equity-chart" viewBox="0 0 700 250" preserveAspectRatio="none" role="img" aria-label="Equity curve has no snapshots yet"></svg><div class="chart-empty" id="chart-empty"><span class="empty-icon"><svg><use href="#i-chart"/></svg></span><strong>No equity snapshots yet</strong><span>Your curve will appear as snapshots are recorded.</span></div></div><div class="chart-footer"><span id="chart-start">—</span><span>PORTFOLIO EQUITY · USD</span><span id="chart-end">—</span></div></section>
             <section class="panel agents-panel"><div class="panel-head"><div><div class="kicker">THE WORKFLOW <span>/ 02</span></div><h2>Agent network</h2><p>Six steps. One connected process.</p></div><span class="agent-count">06</span></div><div id="agents-list" class="agents-list"></div><div class="panel-foot"><span><i class="tiny-dot"></i> AGENT STATUS</span><span>LIVE FROM ENGINE</span></div></section>
