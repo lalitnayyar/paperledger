@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Isolated integration tests; Docker is simulated and no real volumes are touched.
+# Each A && B || fail assertion intentionally fails if either check fails.
+# shellcheck disable=SC2015
 set -euo pipefail
-SOURCE=$(CDPATH= cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+SOURCE=$(CDPATH='' cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/ledger-manage-tests.XXXXXX")
-trap 'rm -rf "$TMP"' EXIT
+PORT_HOLDERS=
+trap 'for pid in $PORT_HOLDERS; do kill "$pid" 2>/dev/null || :; done; rm -rf "$TMP"' EXIT
+ORIG_PATH=$PATH
+SOURCE_VERSION=$(cat "$SOURCE/VERSION")
 COUNT=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 contains() { grep -F -q -- "$2" "$1" || fail "Expected [$2] in $1"; }
 not_contains() { if grep -F -q -- "$2" "$1"; then fail "Unexpected [$2] in $1"; fi; }
+# Only the fixed permission prefix is parsed, not the filename.
+# shellcheck disable=SC2012
 is_private_file() { [ "$(LC_ALL=C ls -ld "$1" | cut -c1-10)" = '-rw-------' ]; }
 fixture() {
     COUNT=$((COUNT+1))
@@ -18,9 +25,10 @@ fixture() {
     cp "$SOURCE/manage.sh" "$SOURCE/compose.yaml" "$SOURCE/.env.example" "$SOURCE/VERSION" "$APP/"
     printf 'original ledger\n' > "$STATE/data/ledger.txt"
     touch "$STATE/container" "$STATE/running" "$STATE/volume" "$STATE/image"
+    printf '8080\n' > "$STATE/port"
     : > "$STATE/log"
     export TEST_STATE="$STATE" TEST_LOG="$STATE/log"
-    export PATH="$CASE/bin:$PATH"
+    export PATH="$CASE/bin:$ORIG_PATH"
     cat > "$CASE/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 set -u
@@ -31,14 +39,26 @@ case "$cmd" in
  info) exit 0 ;;
  compose)
     if [ "${1-}" = version ]; then exit 0; fi
+    [ -z "${APP_PORT+x}" ] || touch "$s/shell_port_leaked"
+    env_file=
     while [ "$#" -gt 0 ]; do
-        case "$1" in --env-file|--project-directory|-f) shift 2 ;; *) break ;; esac
+        case "$1" in --env-file) env_file=$2; shift 2 ;; --project-directory|-f) shift 2 ;; *) break ;; esac
     done
     sub=${1-}; [ "$#" -gt 0 ] && shift
     case "$sub" in
-        ps) if [ -f "$s/container" ]; then for x in "$@"; do [ "$x" = --quiet ] && { printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; exit 0; }; done; fi; exit 0 ;;
-        up) touch "$s/container" "$s/running" "$s/volume" "$s/image" ;;
-        port) printf '127.0.0.1:8080\n' ;;
+        ps) for x in "$@"; do if [ "$x" = --quiet ]; then
+                [ ! -f "$s/container" ] || printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                [ ! -f "$s/second" ] || printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+                exit 0
+            fi; done; exit 0 ;;
+        up) [ ! -f "$s/fail_up" ] || { printf 'simulated port conflict\n' >&2; exit 1; }
+            if [ -n "$env_file" ]; then
+                p=$(awk -F= '/^APP_PORT=[0-9]+$/ { p=$2 } END { print p }' "$env_file")
+                [ -z "$p" ] || printf '%s\n' "$p" > "$s/port"
+            fi
+            touch "$s/container" "$s/running" "$s/volume" "$s/image" ;;
+        port) [ ! -f "$s/fail_port" ] || exit 1
+              if [ -f "$s/reported_port" ]; then cat "$s/reported_port"; else printf '127.0.0.1:%s\n' "$(cat "$s/port")"; fi ;;
         down) rm -f "$s/container" "$s/running" ;;
         start) touch "$s/running" ;;
         stop) rm -f "$s/running" ;;
@@ -62,6 +82,8 @@ case "$cmd" in
     fi ;;
  stop) rm -f "$s/running" ;;
  start) [ -f "$s/fail_start" ] && exit 1; touch "$s/running" ;;
+ logs) id=${2-}; printf 'stdout for %s: sensitive-test-log\n' "$id"; printf 'stderr for %s\n' "$id" >&2
+       [ ! -f "$s/fail_logs" ] || exit 1 ;;
  volume)
     case "${1-}" in
       ls) [ -f "$s/fail_volume_ls" ] && exit 1; [ -f "$s/volume" ] && printf 'ledger-six-data\n'; exit 0 ;;
@@ -95,15 +117,14 @@ esac
 MOCK
     chmod +x "$CASE/bin/docker"
 }
-run_menu() { printf '%b' "$1" | "$APP/manage.sh" > "$CASE/out" 2>&1; }
-
+run_menu() { printf '%b' "$1" | bash "$APP/manage.sh" > "$CASE/out" 2>&1; }
 bash -n "$SOURCE/manage.sh"
 fixture
-(cd /; printf '1\n0\n' | "$APP/manage.sh" > "$CASE/out" 2>&1)
+(cd /; printf '1\n1\n0\n' | bash "$APP/manage.sh" > "$CASE/out" 2>&1)
 [ -f "$APP/.env" ] || fail 'deploy did not create .env'
 is_private_file "$APP/.env" || fail '.env permissions were not 600'
 contains "$STATE/log" $'up\t-d\t--build\tledger'
-contains "$CASE/out" 'Current VERSION: 1.0.0'
+contains "$CASE/out" "Current VERSION: $SOURCE_VERSION"
 
 fixture
 cat > "$APP/.env" <<'ENV'
@@ -117,7 +138,7 @@ export APP_PORT = '8081'
 APP_PORT: 8082
 APP_PORT
 ENV
-run_menu '9\n009999\n0\n'
+run_menu '9\n2\n009999\n0\n'
 contains "$APP/.env" 'APP_PORT=9999'
 contains "$APP/.env" 'APP_PORT=leave-this-alone'
 contains "$APP/.env" 'SECRET_KEY=never-print-this-secret'
@@ -125,13 +146,13 @@ not_contains "$CASE/out" 'never-print-this-secret'
 is_private_file "$APP/.env" || fail 'edited .env permissions were not 600'
 [ "$(grep -c '^APP_PORT=9999$' "$APP/.env")" = 4 ] || fail 'duplicate APP_PORT entries not replaced'
 cp "$APP/.env" "$CASE/before"
-run_menu '9\n65536\n0\n'
+run_menu '9\n2\n65536\n0\n'
 cmp -s "$CASE/before" "$APP/.env" || fail 'invalid port modified .env'
 
 fixture
 printf "SECRET='unclosed\ncontinued\n" > "$APP/.env"
 cp "$APP/.env" "$CASE/before"
-run_menu '9\n8081\n0\n'
+run_menu '9\n2\n8081\n0\n'
 cmp -s "$CASE/before" "$APP/.env" || fail 'malformed multiline variable was altered'
 contains "$CASE/out" 'Could not safely update .env'
 
@@ -178,9 +199,9 @@ not_contains "$STATE/log" $'stop\t'
 fixture
 touch "$STATE/slow_archive"
 printf '10\n0\n' > "$CASE/input"
-"$APP/manage.sh" < "$CASE/input" > "$CASE/out" 2>&1 &
+bash "$APP/manage.sh" < "$CASE/input" > "$CASE/out" 2>&1 &
 pid=$!
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     grep -Fq $'tar\tczf' "$STATE/log" && break
     sleep 0.1
 done
@@ -274,6 +295,181 @@ run_menu '10\n0\n'
 contains "$CASE/out" 'refusing to assume the volume is absent'
 not_contains "$STATE/log" $'stop\t'
 
+# Real socket listeners exercise the bind checks; Docker remains mocked.
+hold_port() {
+    python3 - "$STATE/held-port" <<'PY' &
+import socket, sys, time
+s = socket.socket()
+s.bind(('127.0.0.1', 0))
+s.listen()
+with open(sys.argv[1], 'w') as f:
+    f.write(str(s.getsockname()[1]))
+time.sleep(300)
+PY
+    PORT_HOLDERS="$PORT_HOLDERS $!"
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        [ ! -s "$STATE/held-port" ] || break
+        sleep 0.1
+    done
+    [ -s "$STATE/held-port" ] || fail 'socket holder failed to start'
+    HELD=$(cat "$STATE/held-port")
+}
+free_port() {
+    python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
+}
+
+fixture
+p=$(free_port)
+printf 'APP_PORT=8080\nSECRET_KEY=secret-never-show\n' > "$APP/.env"
+export APP_PORT=23456
+run_menu "1\n2\n00$p\n0\n"
+unset APP_PORT
+contains "$APP/.env" "APP_PORT=$p"
+contains "$APP/.env" 'SECRET_KEY=secret-never-show'
+not_contains "$CASE/out" 'secret-never-show'
+contains "$CASE/out" "Published URL: http://127.0.0.1:$p"
+contains "$CASE/out" 'not a reservation'
+is_private_file "$APP/.env" || fail 'manual deployment did not protect .env'
+contains "$STATE/log" $'up\t-d\t--build\tledger'
+[ ! -f "$STATE/shell_port_leaked" ] || fail 'external APP_PORT leaked into Compose'
+
+fixture
+hold_port
+printf 'APP_PORT=%s\nSECRET_KEY=secret-never-show\n' "$HELD" > "$APP/.env"
+cp "$APP/.env" "$CASE/before"
+printf '8080\n' > "$STATE/port"
+run_menu '1\n1\n0\n'
+contains "$CASE/out" 'Cannot bind 127.0.0.1:'
+not_contains "$STATE/log" $'up\t-d'
+cmp -s "$APP/.env" "$CASE/before" || fail 'occupied configured port changed .env'
+not_contains "$CASE/out" 'secret-never-show'
+run_menu "9\n2\n$HELD\n0\n"
+contains "$CASE/out" 'Cannot bind 127.0.0.1:'
+cmp -s "$APP/.env" "$CASE/before" || fail 'occupied manual port changed .env'
+not_contains "$STATE/log" $'stop\t'
+
+fixture
+hold_port
+printf 'APP_PORT=%s\n' "$HELD" > "$APP/.env"
+printf '%s\n' "$HELD" > "$STATE/port"
+run_menu '1\n1\nNO\n0\n'
+contains "$CASE/out" 'does not prove the local conflict belongs to that service'
+not_contains "$STATE/log" $'up\t-d'
+run_menu '1\n1\nREUSE\n0\n'
+contains "$CASE/out" 'Reusing the reported service port'
+contains "$STATE/log" $'up\t-d\t--build\tledger'
+not_contains "$STATE/log" $'stop\t'
+rm -f "$STATE/running"
+: > "$STATE/log"
+run_menu '1\n1\n0\n'
+contains "$CASE/out" 'Cannot bind 127.0.0.1:'
+not_contains "$STATE/log" $'up\t-d'
+
+fixture
+hold_port
+printf 'APP_PORT=%s\nOTHER=preserved\n' "$HELD" > "$APP/.env"
+run_menu '1\n3\n0\n'
+auto=$(sed -n 's/^APP_PORT=//p' "$APP/.env")
+case "$auto" in ''|*[!0-9]*) fail 'automatic selection did not write a numeric port' ;; esac
+[ "$auto" != "$HELD" ] || fail 'automatic selection chose an occupied port'
+contains "$CASE/out" "Automatically selected local port $auto"
+contains "$CASE/out" "Published URL: http://127.0.0.1:$auto"
+contains "$APP/.env" 'OTHER=preserved'
+is_private_file "$APP/.env" || fail 'automatic selection did not protect .env'
+
+fixture
+p=$(free_port)
+run_menu "9\n2\n$p\n0\n"
+contains "$APP/.env" "APP_PORT=$p"
+contains "$CASE/out" 'To apply a changed port'
+not_contains "$STATE/log" $'up\t-d'
+cp "$APP/.env" "$CASE/before"
+run_menu '9\n2\nabc\n9\n2\n0\n9\n2\n65536\n0\n'
+contains "$CASE/out" 'between 1 and 65535'
+cmp -s "$APP/.env" "$CASE/before" || fail 'invalid manual input changed .env'
+
+fixture
+# The literal Compose interpolation expression is intentional.
+# shellcheck disable=SC2016
+printf 'APP_PORT=${OTHER_PORT}\nOTHER_PORT=12345\n' > "$APP/.env"
+cp "$APP/.env" "$CASE/before"
+run_menu '1\n1\n0\n'
+contains "$CASE/out" 'Cannot keep an invalid or unresolved APP_PORT'
+not_contains "$STATE/log" $'up\t-d'
+cmp -s "$APP/.env" "$CASE/before" || fail 'unresolved port modified .env'
+
+fixture
+# Hide Python while retaining the commands required by the script and mock.
+mkdir "$CASE/no-python"
+for tool in bash dirname cat chmod awk mktemp mv mkdir date touch rm; do
+    ln -s "$(command -v "$tool")" "$CASE/no-python/$tool"
+done
+saved_path=$PATH
+export PATH="$CASE/bin:$CASE/no-python"
+run_menu '1\n3\n1\n2\n23457\n1\n1\n0\n'
+export PATH=$saved_path
+contains "$CASE/out" 'Automatic selection requires a working Python 3 socket probe'
+contains "$CASE/out" 'UNVERIFIED; Docker must check it at startup'
+contains "$APP/.env" 'APP_PORT=23457'
+[ "$(grep -Fc $'up\t-d\t--build\tledger' "$STATE/log")" = 2 ] || fail 'manual/default deployment should work without Python'
+
+fixture
+p=$(free_port)
+touch "$STATE/fail_up"
+run_menu "1\n2\n$p\n0\n"
+contains "$CASE/out" 'Build or startup failed'
+contains "$CASE/out" 'choose another port with option 9'
+contains "$APP/.env" "APP_PORT=$p"
+[ -f "$STATE/volume" ] && [ "$(cat "$STATE/data/ledger.txt")" = 'original ledger' ] || fail 'startup failure damaged data'
+not_contains "$STATE/log" $'volume\trm'
+not_contains "$STATE/log" $'stop\t'
+
+fixture
+p=$(free_port)
+printf '127.0.0.1:54321\n' > "$STATE/reported_port"
+run_menu "1\n2\n$p\n0\n"
+contains "$CASE/out" 'Published URL: http://127.0.0.1:54321'
+not_contains "$CASE/out" "Published URL: http://127.0.0.1:$p"
+printf '0.0.0.0:54321\n' > "$STATE/reported_port"
+run_menu '4\n0\n'
+contains "$CASE/out" 'Could not confirm a single localhost published port'
+not_contains "$CASE/out" 'Published URL:'
+
+fixture
+touch "$STATE/second"
+run_menu '14\n0\n'
+contains "$CASE/out" 'Logs can contain sensitive information'
+contains "$CASE/out" 'no logs were deleted, uploaded, or shared'
+contains "$CASE/out" 'logs must travel from that daemon to this machine'
+not_contains "$CASE/out" 'sensitive-test-log'
+logfile=$(find "$APP/backups/log-exports" -type f -name container-logs.txt)
+[ -n "$logfile" ] && is_private_file "$logfile" || fail 'private log export missing or not mode 600'
+[ "$(grep -c 'stdout for .*sensitive-test-log' "$logfile")" = 2 ] || fail 'not all container stdout was exported'
+[ "$(grep -c 'stderr for ' "$logfile")" = 2 ] || fail 'not all container stderr was exported'
+contains "$CASE/out" "Log export file: $logfile"
+git -C "$SOURCE" check-ignore --no-index -q 'backups/log-exports/example/container-logs.txt' || fail 'log exports are not gitignored'
+grep -qx 'backups/' "$SOURCE/.dockerignore" || fail 'log exports are not excluded from Docker build context'
+
+fixture
+touch "$STATE/fail_logs"
+run_menu '14\n0\n'
+contains "$CASE/out" 'export is incomplete'
+logfile=$(find "$APP/backups/log-exports" -type f -name container-logs.txt)
+[ -n "$logfile" ] && is_private_file "$logfile" || fail 'incomplete private logs were not retained'
+
+fixture
+rm -f "$STATE/container"
+run_menu '14\n0\n'
+contains "$CASE/out" 'No Compose project containers were found'
+[ ! -d "$APP/backups/log-exports" ] || fail 'empty log export created a directory'
+
+fixture
+mkdir "$CASE/outside"
+ln -s "$CASE/outside" "$APP/backups"
+run_menu '14\n0\n'
+contains "$CASE/out" 'Refusing to write logs through a symlinked'
+[ -z "$(ls -A "$CASE/outside")" ] || fail 'logs escaped via symlink'
+
 # Exercise real Git fast-forward behavior entirely in temporary repositories.
 fixture
 printf '.env\nbackups/\n' > "$APP/.gitignore"
@@ -289,7 +485,7 @@ git -C "$CASE/upstream" add VERSION
 git -C "$CASE/upstream" -c user.name=Test -c user.email=test@example.invalid commit -qm update
 git -C "$CASE/upstream" push -q
 run_menu '2\n0\n'
-contains "$CASE/out" 'Version before pull: 1.0.0'
+contains "$CASE/out" "Version before pull: $SOURCE_VERSION"
 contains "$CASE/out" 'Version after pull: 2.0.0'
 contains "$CASE/out" 'Git update applied.'
 contains "$STATE/log" $'up\t-d\t--build\tledger'

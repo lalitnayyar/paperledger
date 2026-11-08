@@ -6,7 +6,7 @@ set -o pipefail
 set -f
 umask 077
 
-ROOT=$(CDPATH= cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || {
+ROOT=$(CDPATH='' cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || {
     printf '%s\n' 'Cannot determine the application directory.' >&2
     exit 1
 }
@@ -71,6 +71,10 @@ create_env_if_missing() {
     if [ -e "$ROOT/.env" ] || [ -L "$ROOT/.env" ]; then
         if [ ! -f "$ROOT/.env" ]; then
             say_error '.env exists but is not a regular file.'
+            return 1
+        fi
+        if ! chmod 600 "$ROOT/.env"; then
+            say_error 'Could not protect .env with mode 600; secure it before continuing.'
             return 1
         fi
         return 0
@@ -383,6 +387,8 @@ do_restore() {
     printf '%s\n' 'Replacing data in the explicitly mounted volume; do not interrupt...'
     # Only /data is writable. Never interpolate host paths or the archive name
     # into this command. The archive must be trusted, not merely readable.
+    # The quoted shell program is evaluated inside the helper container.
+    # shellcheck disable=SC2016
     if ! docker_helper --rm -i --network none --read-only \
         --mount "type=volume,source=$VOLUME,target=/data" alpine:3.20 \
         sh -c 'set -eu; cd /data; find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; left=$(find . -mindepth 1 -maxdepth 1 -print); [ -z "$left" ] || { echo "Could not clear volume" >&2; exit 1; }; tar xzf - -C /data; chown -R 10001:10001 /data' < "$archive"; then
@@ -400,13 +406,185 @@ do_restore() {
     return "$result"
 }
 
+# Read only simple numeric APP_PORT values. Do not evaluate or print .env:
+# Compose interpolation and multiline APP_PORTs require explicit manual repair.
+configured_port() {
+    local value
+    if ! value=$(awk '
+        BEGIN { q=sprintf("%c",39); d=sprintf("%c",34); multi=0; value=""; bad=0 }
+        function closes(s,start,    i,c,esc) {
+            esc=0
+            for (i=start;i<=length(s);i++) {
+                c=substr(s,i,1)
+                if (esc) { esc=0; continue }
+                if (c=="\\") { esc=1; continue }
+                if (c==q) return 1
+            }
+            return 0
+        }
+        {
+            if (multi) { if (closes($0,1)) multi=0; next }
+            if ($0 ~ /^[[:space:]]*(export[[:space:]]+)?APP_PORT[[:space:]]*(#.*)?$/) { value=""; next }
+            if (match($0,/^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[:=][[:space:]]*/)) {
+                prefix=substr($0,1,RLENGTH); v=substr($0,RLENGTH+1)
+                isport=(prefix ~ /^[[:space:]]*(export[[:space:]]+)?APP_PORT[[:space:]]*[:=]/)
+                if (isport) {
+                    if (substr(v,1,1)==q && !closes(v,2)) { bad=1; exit }
+                    sub(/\r$/, "", v); sub(/[[:space:]]+#.*/, "", v)
+                    sub(/^[[:space:]]*/, "", v); sub(/[[:space:]]*$/, "", v)
+                    if ((substr(v,1,1)==q && substr(v,length(v),1)==q) || (substr(v,1,1)==d && substr(v,length(v),1)==d)) v=substr(v,2,length(v)-2)
+                    value=v; next
+                }
+                if (substr(v,1,1)==q && !closes(v,2)) multi=1
+            }
+        }
+        END { if (bad || multi) exit 1; if (value=="") value="8080"; print value }
+    ' "$ROOT/.env" 2>/dev/null); then return 1; fi
+    normalize_port "$value" || return 1
+    CONFIGURED_PORT=$VALID_PORT
+}
+normalize_port() {
+    local p=$1
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    while [ "${#p}" -gt 1 ] && [ "${p#0}" != "$p" ]; do p=${p#0}; done
+    if [ "${#p}" -gt 5 ] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then return 1; fi
+    VALID_PORT=$p
+}
+# Return 0 for successful bind, 2 for a bind failure, 3 for unavailable probe.
+# Port 0 asks the kernel for an ephemeral port. Closing the socket does not
+# reserve it for Docker; it is necessarily a point-in-time check.
+probe_port() {
+    local result rc
+    command -v python3 >/dev/null 2>&1 || return 3
+    result=$(python3 - "$1" 2>/dev/null <<'PY'
+import socket
+import sys
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", int(sys.argv[1])))
+        print(sock.getsockname()[1])
+except OSError:
+    sys.exit(2)
+PY
+    )
+    rc=$?
+    if [ "$rc" -eq 2 ]; then return 2; fi
+    if [ "$rc" -ne 0 ] || ! normalize_port "$result"; then return 3; fi
+    PROBED_PORT=$VALID_PORT
+    return 0
+}
+# A Compose mapping alone cannot prove which process occupies the local port,
+# particularly with remote daemons, WSL, or Docker Desktop. Require both a
+# running project container and its exact loopback mapping before offering reuse.
+own_service_maps_port() {
+    local wanted=$1 endpoint ids id running
+    command -v docker >/dev/null 2>&1 || return 1
+    endpoint=$(compose port "$SERVICE" 8000 2>/dev/null) || return 1
+    [ "$endpoint" = "127.0.0.1:$wanted" ] || return 1
+    ids=$(compose ps --all --quiet "$SERVICE" 2>/dev/null) || return 1
+    for id in $ids; do
+        case "$id" in ''|*[!0-9a-f]*) return 1 ;; esac
+        running=$(docker inspect --format '{{.State.Running}}' "$id" 2>/dev/null) || return 1
+        if [ "$running" = true ]; then return 0; fi
+    done
+    return 1
+}
+check_selected_port() {
+    local port=$1 rc answer
+    if probe_port "$port"; then
+        printf 'Port %s was bindable on this machine at the time of the check; it is not reserved.\n' "$port"
+        return 0
+    else
+        rc=$?
+    fi
+    if [ "$rc" -eq 3 ]; then
+        printf '%s\n' 'Python 3 bind probing is unavailable. This port is UNVERIFIED; Docker must check it at startup.'
+        return 0
+    fi
+    if own_service_maps_port "$port"; then
+        printf '%s\n' 'The local bind failed, but this project reports a running service publishing this exact loopback port.' \
+            'This does not prove the local conflict belongs to that service, especially with WSL, Docker Desktop, or a remote Docker host.'
+        printf 'Type REUSE to try this existing service mapping, or anything else to cancel: '
+        IFS= read -r answer || return 1
+        [ "$answer" = REUSE ] || { printf '%s\n' 'Port selection cancelled; no port was changed.'; return 1; }
+        printf '%s\n' 'Reusing the reported service port; Docker will verify it at startup. No unrelated process will be stopped.'
+        return 0
+    fi
+    say_error "Cannot bind 127.0.0.1:$port (it may be in use or access may be denied). Choose another port or use automatic selection."
+    return 1
+}
+choose_port() {
+    local choice port rc
+    create_env_if_missing || return 1
+    CONFIGURED_PORT=
+    if configured_port; then
+        printf 'Configured APP_PORT: %s\n' "$CONFIGURED_PORT"
+    else
+        printf '%s\n' 'Configured APP_PORT is not a simple valid numeric port, or .env cannot be safely read. Choose a manual or automatic port, or repair .env.'
+    fi
+    printf '%s\n' '1) Keep configured port  2) Enter a port manually  3) Choose an available local port automatically  0) Cancel'
+    printf 'Port choice [1]: '
+    IFS= read -r choice || return 1
+    case "$choice" in
+        ''|1)
+            [ -n "$CONFIGURED_PORT" ] || { say_error 'Cannot keep an invalid or unresolved APP_PORT.'; return 1; }
+            check_selected_port "$CONFIGURED_PORT" || return 1
+            ;;
+        2)
+            printf 'New APP_PORT (1-65535, blank cancels): '
+            IFS= read -r port || return 1
+            [ -n "$port" ] || { printf '%s\n' 'Port selection cancelled.'; return 1; }
+            if ! normalize_port "$port"; then say_error 'Port must contain decimal digits and be between 1 and 65535.'; return 1; fi
+            port=$VALID_PORT
+            check_selected_port "$port" || return 1
+            write_port "$port" || return 1
+            ;;
+        3)
+            if probe_port 0; then
+                port=$PROBED_PORT
+            else
+                rc=$?
+                if [ "$rc" -eq 3 ]; then
+                    say_error 'Automatic selection requires a working Python 3 socket probe. Choose manual or keep the configured port instead; those choices will be unverified.'
+                else
+                    say_error 'Could not bind an automatically assigned local port. Choose a manual port or check local permissions.'
+                fi
+                return 1
+            fi
+            printf 'Automatically selected local port %s; the probe socket has been released, not reserved.\n' "$port"
+            write_port "$port" || return 1
+            ;;
+        0) printf '%s\n' 'Port selection cancelled.'; return 1 ;;
+        *) say_error 'Invalid port choice.'; return 1 ;;
+    esac
+    printf '%s\n' 'A probe is not a reservation: another process can take the port before Docker starts.' \
+        'The probe runs on this machine, not necessarily the Docker daemon host; WSL and Docker Desktop may use different networking/host forwarding.'
+}
+show_published_url() {
+    local endpoint port
+    endpoint=$(compose port "$SERVICE" 8000 2>/dev/null) || endpoint=
+    case "$endpoint" in
+        127.0.0.1:*) port=${endpoint#127.0.0.1:} ;;
+        *) printf '%s\n' 'Could not confirm a single localhost published port from Docker; check Status.'; return 1 ;;
+    esac
+    if ! normalize_port "$port"; then
+        printf '%s\n' 'Docker did not report a valid localhost port; check Status.'
+        return 1
+    fi
+    printf 'Published URL: http://127.0.0.1:%s\n' "$VALID_PORT"
+    printf '%s\n' 'This is localhost on the Docker/forwarding host; WSL, Docker Desktop, and remote Docker may have different host access.'
+}
 do_deploy() {
     check_docker || return 1
-    create_env_if_missing || return 1
+    choose_port || return 1
     printf '%s\n' 'Building and starting Ledger Six; the existing data volume is preserved.'
-    if ! compose up -d --build "$SERVICE"; then say_error 'Build or startup failed.'; return 1; fi
+    if ! compose up -d --build "$SERVICE"; then
+        say_error 'Build or startup failed. The port may have become busy or be unavailable on the Docker host; choose another port with option 9 and retry. Data was not deleted.'
+        return 1
+    fi
     compose ps --all "$SERVICE" || return 1
-    printf '%s\n' 'Service is configured to bind to 127.0.0.1 only. Use Status to check its local port and health.'
+    show_published_url || :
+    printf '%s\n' 'Service is configured to bind to 127.0.0.1 only. Use Status to check its local health.'
 }
 do_update() {
     local before after head_before head_after
@@ -440,8 +618,12 @@ do_update() {
         if [ "$before" = "$after" ]; then printf '%s\n' 'VERSION did not change despite the new commit.'; fi
     fi
     create_env_if_missing || return 1
-    if ! compose up -d --build "$SERVICE"; then say_error 'Code was pulled, but rebuild/start failed; data was preserved.'; return 1; fi
+    if ! compose up -d --build "$SERVICE"; then
+        say_error 'Code was pulled, but rebuild/start failed. The port may be occupied on the Docker host; choose another port with option 9 and retry. Data was not deleted.'
+        return 1
+    fi
     printf '%s\n' 'Rebuild and startup completed.'
+    show_published_url || :
 }
 do_status() {
     check_docker || return 1
@@ -467,17 +649,9 @@ do_status() {
         return 1
     fi
 }
-do_port() {
-    local port temp
-    create_env_if_missing || return 1
+write_port() {
+    local port=$1 temp
     if [ -L "$ROOT/.env" ]; then say_error 'Refusing to replace a symlinked .env. Edit it securely by hand.'; return 1; fi
-    printf 'New APP_PORT (1-65535, blank cancels): '
-    IFS= read -r port || return 1
-    [ -n "$port" ] || { printf '%s\n' 'Port change cancelled.'; return 0; }
-    case "$port" in *[!0-9]*) say_error 'Port must contain decimal digits only.'; return 1 ;; esac
-    # Avoid shell arithmetic octal interpretation and overly large numeric input.
-    while [ "${#port}" -gt 1 ] && [ "${port#0}" != "$port" ]; do port=${port#0}; done
-    if [ "${#port}" -gt 5 ] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then say_error 'Port must be between 1 and 65535.'; return 1; fi
     if ! temp=$(mktemp "$ROOT/.env.manage-XXXXXX"); then say_error 'Could not create a protected temporary .env.'; return 1; fi
     TEMP_ENV=$temp
     if ! chmod 600 "$temp"; then rm -f "$temp"; TEMP_ENV=; say_error 'Could not protect temporary .env.'; return 1; fi
@@ -524,8 +698,48 @@ do_port() {
     if ! mv -f "$temp" "$ROOT/.env"; then rm -f "$temp"; TEMP_ENV=; say_error 'Could not replace .env; original file was preserved.'; return 1; fi
     TEMP_ENV=
     printf 'APP_PORT set to %s in protected .env. All other entries were retained.\n' "$port"
-    printf '%s\n' 'To apply the port, choose install/build/start; existing data is preserved. The included Compose file binds 127.0.0.1 only.'
-    printf '%s\n' 'This script ignores a shell-exported APP_PORT when running Compose. External Compose invocations may override .env.'
+}
+do_export_logs() {
+    local ids id stamp dir file failed=0 count=0
+    check_docker || return 1
+    printf '%s\n' 'Logs can contain sensitive information, including secrets or private data. Store and share this file securely.'
+    printf '%s\n' 'For a remote Docker daemon, logs must travel from that daemon to this machine over the Docker connection.'
+    if ! ids=$(compose ps --all --quiet); then
+        say_error 'Could not list containers in this Compose project; no logs were exported.'
+        return 1
+    fi
+    if [ -z "$ids" ]; then say_error 'No Compose project containers were found; there are no container logs to export.'; return 1; fi
+    for id in $ids; do
+        case "$id" in ''|*[!0-9a-f]*) say_error 'Unexpected Docker container ID; no logs were exported.'; return 1 ;; esac
+    done
+    if [ -L "$BACKUP_DIR" ] || [ -L "$BACKUP_DIR/log-exports" ]; then
+        say_error 'Refusing to write logs through a symlinked backup or log-exports directory.'
+        return 1
+    fi
+    if ! mkdir -p "$BACKUP_DIR/log-exports" || ! chmod 700 "$BACKUP_DIR" "$BACKUP_DIR/log-exports"; then
+        say_error 'Cannot create or protect the log export directory.'
+        return 1
+    fi
+    stamp=$(date '+%Y%m%d-%H%M%S') || return 1
+    dir=$(mktemp -d "$BACKUP_DIR/log-exports/ledger-six-logs-$stamp-XXXXXX") || { say_error 'Could not create a unique private export directory.'; return 1; }
+    file="$dir/container-logs.txt"
+    if ! : > "$file" || ! chmod 600 "$file"; then say_error 'Could not create a private log file.'; return 1; fi
+    if ! printf 'Ledger Six Compose project container logs; exported %s\n' "$stamp" >> "$file"; then
+        say_error "Could not write the private log file: $file"
+        return 1
+    fi
+    for id in $ids; do
+        count=$((count+1))
+        if ! printf '\n===== Container %s =====\n' "$id" >> "$file"; then failed=1; break; fi
+        if ! docker logs --timestamps "$id" >> "$file" 2>&1; then failed=1; fi
+    done
+    printf 'Log export file: %s\n' "$file"
+    printf '%s\n' 'The file remains on this machine; no logs were deleted, uploaded, or shared by this script. Copy or download it securely.'
+    if [ "$failed" -ne 0 ]; then
+        say_error 'Some logs could not be collected or written; the export is incomplete. Check Docker and the private file.'
+        return 1
+    fi
+    printf 'Exported logs for %s project container(s).\n' "$count"
 }
 do_clean() {
     check_docker || return 1
@@ -583,9 +797,10 @@ show_menu() {
 3) Status and local health       4) Start existing service
 5) Stop service                  6) Restart existing service
 7) View logs                     8) Follow logs (Ctrl-C to stop)
-9) Change APP_PORT              10) Back up data volume
+9) Choose APP_PORT              10) Back up data volume
 11) Restore trusted backup      12) Clean removal (preserve data)
-13) Full deletion (DANGER)       0) Exit / back
+13) Full deletion (DANGER)      14) Export all container logs to one private file
+0) Exit / back
 MENU
 }
 usage() {
@@ -596,7 +811,8 @@ Only trusted backup archives may be restored. Back up .env and any external
 encryption key separately. Archives and logs can contain sensitive information.
 The named data volume and image tag are global and must not be shared with other
 projects. Do not run concurrent administration or volume writers. Backups
-require the alpine:3.20 image, pulled by Docker if absent.
+require the alpine:3.20 image, pulled by Docker if absent. Port checks are local
+and temporary; Docker is authoritative and may run on a different host.
 EOF
 }
 case "${1-}" in
@@ -616,16 +832,26 @@ while :; do
         1) do_deploy || : ;;
         2) do_update || : ;;
         3) do_status || : ;;
-        4) if check_docker; then compose start "$SERVICE" || say_error 'Start failed; deploy first if no container exists.'; fi ;;
+        4) if check_docker; then
+               if compose start "$SERVICE"; then show_published_url || :
+               else say_error 'Start failed; the port may be occupied. Choose another port with option 9 and deploy with option 1, or deploy first if no container exists.'; fi
+           fi ;;
         5) if check_docker; then compose stop "$SERVICE" || say_error 'Stop failed.'; fi ;;
-        6) if check_docker; then compose restart "$SERVICE" || say_error 'Restart failed; deploy first if no container exists.'; fi ;;
+        6) if check_docker; then
+               if compose restart "$SERVICE"; then show_published_url || :
+               else say_error 'Restart failed; the port may be occupied. Choose another port with option 9 and deploy with option 1.'; fi
+           fi ;;
         7) if check_docker; then printf '%s\n' 'Logs may contain sensitive information.'; compose logs --tail 200 "$SERVICE" || say_error 'Could not read logs.'; fi ;;
         8) if check_docker; then printf '%s\n' 'Logs may contain sensitive information. Press Ctrl-C to return or exit.'; compose logs --follow --tail 200 "$SERVICE" || :; fi ;;
-        9) do_port || : ;;
+        9) if choose_port; then
+               printf '%s\n' 'To apply a changed port, choose install/build/start; existing data is preserved. The included Compose file binds 127.0.0.1 only.' \
+                   'This script ignores a shell-exported APP_PORT for Compose; external Compose invocations may override .env.'
+           fi ;;
         10) do_backup || : ;;
         11) do_restore || : ;;
         12) do_clean || : ;;
         13) do_delete || : ;;
+        14) do_export_logs || : ;;
         0|q|Q) printf '%s\n' 'Exiting; no additional changes made.'; break ;;
         *) printf '%s\n' 'Invalid choice.' ;;
     esac

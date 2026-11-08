@@ -1,8 +1,38 @@
-# Ledger Six
+# PaperLedger / Ledger Six
 
-A self-hosted trading research and paper-ledger terminal, inspired by the six-stage dashboard described in [this post](https://x.com/quantumaix8/status/2119224881523097979). This is an independent implementation, not the original software. The post's profit claims have not been independently verified and are not a performance expectation.
+A self-hosted dashboard for stock and cryptocurrency paper trading, with a persistent ledger, market scanner, configurable AI providers, and an interactive Docker administration script.
 
 **Personal project disclaimer:** This software is for educational and personal use only. It is not investment, financial, tax, or legal advice. Trading involves substantial risk, including loss of all capital. There is no guarantee of profits, data accuracy, or future performance. Use at your own risk.
+
+**Lalit Nayyar**
+
+Email: [lalitnayyar@gmail.com](mailto:lalitnayyar@gmail.com)
+
+Phone: [+971 50 832 0336](tel:+971508320336) / [+91 95953 53336](tel:+919595353336)
+
+## Screenshots
+
+These screenshots were captured from the application in a sandbox. The example balances and stock trades are illustrative simulated data, not a real account or performance record. The scanner screenshot is a time-specific external market-data snapshot; its prices may be stale and it is not an endorsement or safety assessment.
+
+### Dashboard and workflow
+
+![PaperLedger dashboard showing paper portfolio, workflow stages, equity history and scanner](docs/screenshots/dashboard.png)
+
+### Stock and crypto ledger
+
+![Paper ledger showing an illustrative stock position, trade history and mark-price controls](docs/screenshots/ledger.png)
+
+### Risk and LLM settings
+
+![Risk settings and configurable LLM provider controls](docs/screenshots/settings.png)
+
+### Token scanner
+
+![Scanner showing a time-specific market-data snapshot and basic threshold results](docs/screenshots/scanner.png)
+
+### Light theme
+
+![PaperLedger dashboard in the light theme](docs/screenshots/light.png)
 
 ## Important boundaries
 
@@ -24,7 +54,21 @@ A self-hosted trading research and paper-ledger terminal, inspired by the six-st
 
 ## Start with Docker
 
-1. Extract the project ZIP. Open a terminal **inside the extracted folder containing `compose.yaml`**.
+Clone this repository and open the interactive administrator:
+
+```bash
+git clone https://github.com/lalitnayyar/paperledger.git
+cd paperledger
+bash manage.sh
+```
+
+Choose **Install / build / start**. The manager offers the configured port, a manually chosen port, or an automatically selected available port, then displays the local URL reported by Docker. Automatic selection requires Python 3 on the machine running the script. Without Python 3, manual and configured ports are unverified until Docker binds them. On Windows, use WSL with Docker Desktop integration or Git Bash with Docker Desktop running. The probe checks the local environment, which can differ from the Docker host; a port can also become occupied between probing and startup. If Docker reports a conflict, choose another port and retry.
+
+Alternatively, extract `ledger-six-docker.zip`, open the extracted `tradeledger` folder, and run `bash manage.sh`. The archive is not a Git checkout, so clone the repository if you want to use the manager's Git update option.
+
+For a direct non-interactive deployment with the default port:
+
+1. Open a terminal **inside the repository folder containing `compose.yaml`**.
 2. Copy the example environment file:
 
    ```bash
@@ -55,7 +99,7 @@ docker compose restart
 docker compose down              # Stops/removes the container, but preserves data.
 ```
 
-Linux/macOS and Git Bash users can also run `./deploy.sh`. To pull the latest code from GitHub and rebuild an **existing Git checkout with a configured upstream**, run `./deploy.sh --update`. It displays the current version and the version after the pull, requires a clean tracked working tree, uses `git pull --ff-only`, and preserves the data volume. An extracted ZIP is not a Git checkout; obtain a fresh ZIP or clone your own repository first. The archive does not assume a GitHub repository or publish code anywhere.
+Linux/macOS and Git Bash users can also run `./deploy.sh`. To pull the latest code from GitHub and rebuild an **existing Git checkout with a configured upstream**, run `./deploy.sh --update`. It displays the current version and the version after the pull, requires a clean tracked working tree, uses `git pull --ff-only`, and preserves the data volume. An extracted ZIP is not a Git checkout; clone the repository first to use this option.
 
 ### Interactive administration
 
@@ -65,7 +109,7 @@ Run the administrative menu from the project directory:
 bash manage.sh
 ```
 
-On Windows, use WSL with Docker Desktop integration or Git Bash with Docker Desktop running. The menu can install and rebuild, pull from an existing Git checkout, show the current version and health, start/stop/restart the service, view logs, change the local port, back up or restore data, and remove the application. Port changes are applied when you select install/build/start again. Clean removal preserves data; the separate full-deletion option requires typing `DELETE DATA`. Both preserve `.env` and the `backups/` directory.
+On Windows, use WSL with Docker Desktop integration or Git Bash with Docker Desktop running. The menu can install and rebuild, pull from an existing Git checkout, show the current version and health, start/stop/restart the service, view and export logs, choose or find an available local port, back up or restore data, and remove the application. Option **9** changes the port; apply it by choosing install/build/start. Option **14** exports all Compose-project container logs into one private file under `backups/log-exports/` and prints its path. Clean removal preserves data; the separate full-deletion option requires typing `DELETE DATA`. Both preserve `.env` and the `backups/` directory. Exported logs may contain sensitive information; review them before sharing.
 
 The menu's backups are stored under `backups/` with restricted permissions where the filesystem supports them. They can contain private ledger data and the generated encryption key. Restore accepts **trusted archives only**, requires typing `RESTORE DATA`, and creates a backup of the existing volume before replacing it. A failed restore keeps the application stopped and reports the pre-restore backup location. The menu does not include `.env` or externally supplied encryption keys in its archive; back them up separately. Do not run concurrent administration or other writers against the volume. Backups use an `alpine:3.20` helper image, which Docker may need to download.
 
@@ -148,7 +192,6 @@ On Windows, activate with `.venv\Scripts\Activate.ps1` and set `$env:DATA_DIR = 
 
 ## References
 
-- [Original reference post](https://x.com/quantumaix8/status/2119224881523097979)
 - [DEX Screener API reference](https://docs.dexscreener.com/api/reference)
 - [Ollama OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility)
 - [Ollama cloud models](https://ollama.com/blog/cloud-models)
