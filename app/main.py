@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from app import db, trading
 from app.llm import router as llm_router
+from app.market_data import router as market_data_router
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -27,6 +28,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="TradeLedger Paper Trading", lifespan=lifespan)
 app.include_router(llm_router)
+app.include_router(market_data_router)
 
 
 @app.middleware("http")
@@ -73,6 +75,27 @@ class SettingsUpdate(StrictModel):
     take_profit_percent: float | None = Field(default=None, gt=0, le=10000)
     auto_paper: StrictBool | None = None
     scan_interval_seconds: int | None = Field(default=None, ge=10, le=86400, strict=True)
+    market_mode: Literal["crypto", "stocks", "both"] | None = None
+    stock_symbols: list[str] | None = Field(default=None, min_length=1, max_length=20)
+
+    @field_validator("stock_symbols", mode="before")
+    @classmethod
+    def normalize_stock_symbols(cls, values):
+        if values is None:
+            return None
+        if not isinstance(values, list):
+            raise ValueError("Stock symbols must be a list")
+        symbols = []
+        for value in values:
+            if not isinstance(value, str) or not value.isascii():
+                raise ValueError("Stock symbols must use US ticker syntax")
+            symbol = value.strip().upper()
+            if not trading.STOCK_SYMBOL_RE.fullmatch(symbol):
+                raise ValueError("Use US-listed ticker syntax, such as IBM or BRK.B")
+            symbols.append(symbol)
+        if len(set(symbols)) != len(symbols):
+            raise ValueError("Stock symbols must not contain duplicates")
+        return symbols
 
 
 class ManualTrade(StrictModel):
@@ -139,7 +162,7 @@ def health():
 def dashboard():
     data = trading.dashboard()
     data["disclosures"] = {
-        "market_data": "DexScreener results are recently profiled tokens, not necessarily new pairs. Values may be stale; check observation times.",
+        "market_data": "DexScreener shows recently profiled tokens, not necessarily new pairs. Alpha Vantage GLOBAL_QUOTE is end-of-day historical data, not real-time: quote_date is its trading date, stock_volume_shares is shares, and stock_change_percent is close-to-close. Enter US-listed USD stocks only; the provider does not guarantee currency or verify US listing. With no key, the demo is available only for IBM. Each stock symbol uses one request; the free tier generally permits 25 requests per day, subject to provider limits. Stock quotes are manual paper trades only and do not update marks. All data may be stale; check dates and observation times.",
         "risk": "Basic price, liquidity and volume checks do not detect scams, honeypots, rug pulls, or ensure safety.",
         "marks": "Unmarked positions make total equity and total unrealized P&L unavailable. Entry price includes allocated buy fees.",
         "orders": "Paper simulation only; no live orders. No automated stop-loss or take-profit execution; stop is a sizing assumption and take-profit is advisory.",
@@ -199,7 +222,7 @@ async def cycle():
     trades, skipped = [], []
     if enabled:
         for candidate in scan_result["candidates"]:
-            if candidate["risk_status"] != "eligible":
+            if candidate.get("asset_type", "crypto") != "crypto" or candidate["risk_status"] != "eligible":
                 continue
             # Bound one manual cycle to at most three new positions.
             if len(trades) >= 3:

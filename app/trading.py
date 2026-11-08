@@ -1,19 +1,21 @@
-"""Paper-only accounting and a deliberately limited DexScreener scanner."""
+"""Paper-only accounting and crypto/stock quote scanning; no live execution."""
 from __future__ import annotations
 
 import asyncio
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from typing import Any
 from urllib.parse import quote, urlparse
 
 import httpx
+from fastapi import HTTPException
 
-from app import db
+from app import db, market_data
 
 D = lambda value: Decimal(str(value))
 SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,23}$")
+STOCK_SYMBOL_RE = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z]{1,4})?$")
 ADDRESS_RE = re.compile(r"^[A-Za-z0-9:_-]{1,160}$")
 _scan_lock = asyncio.Lock()
 
@@ -84,9 +86,12 @@ def dashboard() -> dict[str, Any]:
         result["settings"] = db.get_settings(conn)
         result["agents"] = [dict(row) for row in conn.execute("SELECT id,name,status,detail FROM agents ORDER BY rowid")]
         result["candidates"] = []
-        for row in conn.execute("SELECT symbol,chain,pair_address,price_usd,liquidity_usd,volume_24h,price_change_24h,volume_spike_ratio,pair_created_at,risk_status,reason,url,observed_at FROM candidates ORDER BY id"):
+        mode = result["settings"]["market_mode"]
+        for row in conn.execute("SELECT symbol,chain,pair_address,price_usd,liquidity_usd,volume_24h,price_change_24h,volume_spike_ratio,pair_created_at,risk_status,reason,url,observed_at,asset_type,source,quote_date,stock_volume_shares,stock_change_percent FROM candidates WHERE (?='both' OR asset_type=?) ORDER BY id", (mode, "stock" if mode == "stocks" else "crypto")):
             item = dict(row)
-            for k in ("price_usd", "liquidity_usd", "volume_24h", "price_change_24h", "volume_spike_ratio"):
+            if item["asset_type"] == "stock":
+                item["chain"] = item["pair_address"] = None
+            for k in ("price_usd", "liquidity_usd", "volume_24h", "price_change_24h", "volume_spike_ratio", "stock_change_percent"):
                 item[k] = _f(item[k])
             result["candidates"].append(item)
         result["trades"] = []
@@ -126,6 +131,8 @@ def _execute_in_transaction(conn, *, symbol: str, asset_type: str, side: str, qu
     settings = db.get_settings(conn)
     if automatic and not settings["auto_paper"]:
         raise TradeError("Auto-paper has been disabled; no order was placed.")
+    if automatic and (asset_type != "crypto" or settings["market_mode"] not in ("crypto", "both")):
+        raise TradeError("Automatic paper orders are restricted to crypto in the current market mode.")
     row = conn.execute("SELECT * FROM positions WHERE symbol=? AND asset_type=?", (symbol, asset_type)).fetchone()
     if automatic and row is not None:
         raise TradeError("Position already open for this symbol; automatic duplicate skipped.")
@@ -238,78 +245,198 @@ def _candidate(pair: dict[str, Any], settings: dict[str, Any], observed: str) ->
         "pair_created_at": pair_created_at,
         "risk_status": "filtered" if reasons else "eligible",
         "reason": "; ".join(reasons) if reasons else "Meets liquidity and volume thresholds; not a safety or rug-pull assessment.",
-        "url": _url(pair.get("url")), "observed_at": observed}
+        "url": _url(pair.get("url")), "observed_at": observed,
+        "asset_type": "crypto", "source": "DexScreener", "quote_date": None,
+        "stock_volume_shares": None, "stock_change_percent": None}
+
+
+async def _scan_crypto(settings: dict[str, Any]) -> tuple[list[dict], int]:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False, headers={"Accept": "application/json", "User-Agent": "LocalPaperLedger/1.0"}) as client:
+        response = await client.get("https://api.dexscreener.com/token-profiles/latest/v1")
+        response.raise_for_status()
+        profiles = response.json()
+        if not isinstance(profiles, list):
+            raise ScanError("Invalid token profiles response")
+        tokens = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            chain, addr = str(profile.get("chainId") or ""), str(profile.get("tokenAddress") or "")
+            if ADDRESS_RE.fullmatch(chain) and ADDRESS_RE.fullmatch(addr) and token_key(chain, addr) not in [token_key(c, a) for c, a in tokens]:
+                tokens.append((chain, addr))
+            if len(tokens) >= 30:
+                break
+        pairs = []
+        if tokens:
+            response = await client.get("https://api.dexscreener.com/latest/dex/tokens/" + quote(",".join(a for _, a in tokens), safe=","))
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or (payload.get("pairs") is not None and not isinstance(payload["pairs"], list)):
+                raise ScanError("Invalid token pairs response")
+            pairs = payload.get("pairs") or []
+    observed = db.utc_now()
+    # Only a pair's base-token price is priceUsd.
+    matches: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    selected = {token_key(c, a) for c, a in tokens}
+    for pair in pairs:
+        if not isinstance(pair, dict) or not isinstance(pair.get("baseToken"), dict):
+            continue
+        key = token_key(str(pair.get("chainId") or ""), str(pair["baseToken"].get("address") or ""))
+        if key not in selected:
+            continue
+        item = _candidate(pair, settings, observed)
+        if item:
+            matches.setdefault(key, []).append(item)
+    candidates = []
+    for chain, token in tokens:
+        options = matches.get(token_key(chain, token), [])
+        if options:
+            candidates.append(max(options, key=lambda x: D(x["liquidity_usd"]) if x["liquidity_usd"] is not None else D(-1)))
+    return candidates, len(tokens)
+
+
+def _stock_candidate(payload: Any, symbol: str, observed: str) -> dict | None:
+    if not isinstance(payload, dict) or not isinstance(payload.get("Global Quote"), dict):
+        return None
+    quote_data = payload["Global Quote"]
+    if quote_data.get("01. symbol") != symbol:
+        return None
+    price = safe_number(quote_data.get("05. price"), positive=True)
+    volume = safe_number(quote_data.get("06. volume"))
+    quote_date = quote_data.get("07. latest trading day")
+    try:
+        if not isinstance(quote_date, str) or date.fromisoformat(quote_date).isoformat() != quote_date:
+            return None
+    except ValueError:
+        return None
+    if price is None or volume is None or volume < 0 or volume != volume.to_integral_value():
+        return None
+    raw_change = quote_data.get("10. change percent")
+    change = safe_number(raw_change[:-1]) if isinstance(raw_change, str) and raw_change.endswith("%") else None
+    return {"symbol": symbol, "chain": None, "pair_address": None, "price_usd": str(price),
+            "liquidity_usd": None, "volume_24h": None, "price_change_24h": None,
+            "volume_spike_ratio": None, "pair_created_at": None, "risk_status": "manual only",
+            "reason": "Stock quote for manual paper trades only; end-of-day historical data, no liquidity or risk assessment. USD assumed for US-listed stocks; currency is not guaranteed by the provider.",
+            "url": None, "observed_at": observed, "asset_type": "stock", "source": "Alpha Vantage",
+            "quote_date": quote_date, "stock_volume_shares": int(volume),
+            "stock_change_percent": str(change) if change is not None else None}
+
+
+async def _scan_stocks(symbols: list[str]) -> tuple[list[dict], list[str]]:
+    warnings = []
+    candidates = []
+    try:
+        key = market_data.load_key()
+    except HTTPException:
+        return [], ["Alpha Vantage market key is unavailable or cannot be decrypted; check encryption configuration."]
+    if key is None:
+        if "IBM" in symbols:
+            warnings.append("Alpha Vantage demo key is used for IBM only; quotes are end-of-day historical, not real-time.")
+        for symbol in symbols:
+            if symbol != "IBM":
+                warnings.append(f"{symbol}: configure your own Alpha Vantage API key; the demo key is only available for IBM.")
+        symbols = [symbol for symbol in symbols if symbol == "IBM"]
+        key = "demo"
+    if not symbols:
+        return candidates, warnings
+    # One request per symbol, sequentially, no retries, capped total duration.
+    deadline = asyncio.get_running_loop().time() + 30
+    async with httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False,
+                                 headers={"Accept": "application/json", "User-Agent": "LocalPaperLedger/1.0"}) as client:
+        for index, symbol in enumerate(symbols):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                warnings.extend(f"{s}: skipped after stock scan time limit." for s in symbols[index:])
+                break
+            try:
+                response = await asyncio.wait_for(client.get("https://www.alphavantage.co/query", params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": key}), timeout=remaining)
+                response.raise_for_status()
+                payload = response.json()
+                if isinstance(payload, dict) and ("Note" in payload or "Information" in payload):
+                    warnings.append(f"{symbol}: Alpha Vantage returned a quota or information notice; no quote available.")
+                    warnings.extend(f"{s}: skipped after provider notice to avoid further requests." for s in symbols[index + 1:])
+                    break
+                if isinstance(payload, dict) and "Error Message" in payload:
+                    warnings.append(f"{symbol}: Alpha Vantage rejected the symbol or request.")
+                    continue
+                item = _stock_candidate(payload, symbol, db.utc_now())
+                if item is None:
+                    warnings.append(f"{symbol}: Alpha Vantage returned an empty or invalid quote.")
+                else:
+                    candidates.append(item)
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                warnings.append(f"{symbol}: Alpha Vantage returned HTTP {status}.")
+                if status == 429:
+                    warnings.extend(f"{s}: skipped after rate limit to avoid further requests." for s in symbols[index + 1:])
+                    break
+            except (asyncio.TimeoutError, httpx.TimeoutException):
+                warnings.append(f"{symbol}: Alpha Vantage request timed out.")
+            except Exception:
+                # Never include exception details, upstream bodies, or query URLs.
+                warnings.append(f"{symbol}: Alpha Vantage request failed or returned invalid data.")
+    return candidates, warnings
+
+
+_CANDIDATE_FIELDS = ("symbol", "chain", "pair_address", "price_usd", "liquidity_usd", "volume_24h",
+    "price_change_24h", "volume_spike_ratio", "pair_created_at", "risk_status", "reason", "url",
+    "observed_at", "asset_type", "source", "quote_date", "stock_volume_shares", "stock_change_percent")
+_DECIMAL_CANDIDATE_FIELDS = ("price_usd", "liquidity_usd", "volume_24h", "price_change_24h", "volume_spike_ratio", "stock_change_percent")
 
 
 async def scan_market() -> dict[str, Any]:
     async with _scan_lock:
-        try:
-            async with httpx.AsyncClient(timeout=15, follow_redirects=False, headers={"Accept": "application/json", "User-Agent": "LocalPaperLedger/1.0"}) as client:
-                response = await client.get("https://api.dexscreener.com/token-profiles/latest/v1")
-                response.raise_for_status()
-                profiles = response.json()
-                if not isinstance(profiles, list):
-                    raise ScanError("Token profiles response is not a list.")
-                # Limit a public endpoint scan to the first 30 unique token profiles.
-                tokens = []
-                for profile in profiles:
-                    if not isinstance(profile, dict):
-                        continue
-                    chain, addr = str(profile.get("chainId") or ""), str(profile.get("tokenAddress") or "")
-                    if ADDRESS_RE.fullmatch(chain) and ADDRESS_RE.fullmatch(addr) and token_key(chain, addr) not in [token_key(c, a) for c, a in tokens]:
-                        tokens.append((chain, addr))
-                    if len(tokens) >= 30:
-                        break
-                pairs = []
-                if tokens:
-                    response = await client.get("https://api.dexscreener.com/latest/dex/tokens/" + quote(",".join(a for _, a in tokens), safe=","))
-                    response.raise_for_status()
-                    payload = response.json()
-                    if not isinstance(payload, dict) or (payload.get("pairs") is not None and not isinstance(payload["pairs"], list)):
-                        raise ScanError("Token pairs response has an unexpected format.")
-                    pairs = payload.get("pairs") or []
-            observed = db.utc_now()
-            with db.transaction() as conn:
-                settings = db.get_settings(conn)
-                # Only a pair's base token price is its priceUsd. Do not mistake the
-                # price of a quote token for the price of the profiled token.
-                matches: dict[tuple[str, str], list[dict[str, Any]]] = {}
-                selected = {token_key(c, a) for c, a in tokens}
-                for pair in pairs:
-                    if not isinstance(pair, dict) or not isinstance(pair.get("baseToken"), dict):
-                        continue
-                    key = token_key(str(pair.get("chainId") or ""), str(pair["baseToken"].get("address") or ""))
-                    if key not in selected:
-                        continue
-                    item = _candidate(pair, settings, observed)
-                    if item:
-                        matches.setdefault(key, []).append(item)
-                candidates = []
-                for chain, token in tokens:
-                    options = matches.get(token_key(chain, token), [])
-                    if options:
-                        # Use the most liquid pool for a token, not every duplicate pair.
-                        candidates.append(max(options, key=lambda x: D(x["liquidity_usd"]) if x["liquidity_usd"] is not None else D(-1)))
-                conn.execute("DELETE FROM candidates")
-                for item in candidates:
-                    conn.execute("INSERT INTO candidates(symbol,chain,pair_address,price_usd,liquidity_usd,volume_24h,price_change_24h,volume_spike_ratio,pair_created_at,risk_status,reason,url,observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(item[k] for k in ("symbol", "chain", "pair_address", "price_usd", "liquidity_usd", "volume_24h", "price_change_24h", "volume_spike_ratio", "pair_created_at", "risk_status", "reason", "url", "observed_at")))
-                    # Only refresh a position if it has this exact on-chain pair identity.
-                    if item["price_usd"] is not None:
-                        conn.execute("UPDATE positions SET mark_price=?,mark_source='dexscreener',mark_timestamp=? WHERE asset_type='crypto' AND chain=? AND pair_address=?", (item["price_usd"], observed, item["chain"], item["pair_address"]))
-                db.snapshot(conn)
-                eligible = sum(c["risk_status"] == "eligible" for c in candidates)
-                detail = f"Scanned {len(tokens)} latest token profiles; {len(candidates)} matched base-token pairs, {eligible} meet basic thresholds."
-                db.set_agent(conn, "scanner", "ready", detail)
-                db.set_agent(conn, "rug_check", "ready", "Liquidity/volume checks only; cannot identify scams, honeypots or rug pulls.")
-                db.log(conn, "scanner", detail)
-            return {"observed_at": observed, "profiles_scanned": len(tokens), "candidates": [{**c, **{k: _f(c[k]) for k in ("price_usd", "liquidity_usd", "volume_24h", "price_change_24h", "volume_spike_ratio")}} for c in candidates]}
-        except (httpx.HTTPError, ValueError, ScanError) as exc:
-            # Do not leak raw upstream URLs, response bodies, or tokens into logs.
-            detail = "DexScreener scan failed; previously saved candidates may be stale."
+        with db.read_connection() as conn:
+            settings = db.get_settings(conn)
+        mode = settings["market_mode"]
+        candidates, warnings, profiles_scanned = [], [], 0
+        successful_sources = 0
+        if mode in ("crypto", "both"):
+            try:
+                crypto, profiles_scanned = await _scan_crypto(settings)
+                candidates.extend(crypto)
+                successful_sources += 1
+            except (httpx.HTTPError, OSError, ValueError, TypeError, ScanError):
+                warnings.append("DexScreener scan failed; no crypto candidates from this scan.")
+        if mode in ("stocks", "both"):
+            stocks, stock_warnings = await _scan_stocks(settings["stock_symbols"])
+            candidates.extend(stocks)
+            warnings.extend(stock_warnings)
+            if stocks:
+                successful_sources += 1
+        observed = db.utc_now()
+        if not successful_sources:
+            detail = "All requested market sources failed; previously saved candidates may be stale. " + " ".join(warnings)
             with db.transaction() as conn:
                 db.set_agent(conn, "scanner", "error", detail)
                 db.log(conn, "scanner", detail, "error")
-            raise ScanError(detail) from exc
+            raise ScanError(detail)
+        with db.transaction() as conn:
+            current = db.get_settings(conn)
+            changed = current["market_mode"] != mode or (mode in ("stocks", "both") and current["stock_symbols"] != settings["stock_symbols"])
+            if changed:
+                detail = "Market settings changed during scan; no candidates were saved or traded. Scan again."
+                db.set_agent(conn, "scanner", "error", detail)
+                db.log(conn, "scanner", detail, "error")
+            else:
+                conn.execute("DELETE FROM candidates")
+                for item in candidates:
+                    # Legacy chain/pair columns are NOT NULL. Empty storage values are
+                    # represented as null in the API for stock rows.
+                    values = [item[k] if k not in ("chain", "pair_address") else item[k] or "" for k in _CANDIDATE_FIELDS]
+                    conn.execute("INSERT INTO candidates(" + ",".join(_CANDIDATE_FIELDS) + ") VALUES (" + ",".join("?" for _ in _CANDIDATE_FIELDS) + ")", values)
+                    if item["asset_type"] == "crypto" and item["price_usd"] is not None:
+                        conn.execute("UPDATE positions SET mark_price=?,mark_source='dexscreener',mark_timestamp=? WHERE asset_type='crypto' AND chain=? AND pair_address=?", (item["price_usd"], item["observed_at"], item["chain"], item["pair_address"]))
+                db.snapshot(conn)
+                eligible = sum(c["risk_status"] == "eligible" for c in candidates)
+                detail = f"Market scan ({mode}): {profiles_scanned} crypto profiles, {len(candidates)} candidates, {eligible} eligible for crypto paper cycles; {len(warnings)} warning(s)."
+                db.set_agent(conn, "scanner", "warning" if warnings else "ready", detail)
+                db.set_agent(conn, "rug_check", "ready", "Crypto liquidity/volume checks only; cannot identify scams, honeypots or rug pulls. Stocks are manual only.")
+                db.log(conn, "scanner", detail, "warning" if warnings else "info")
+        if changed:
+            raise ScanError(detail)
+        return {"observed_at": observed, "profiles_scanned": profiles_scanned, "market_mode": mode,
+                "warnings": warnings, "candidates": [{**c, **{k: _f(c[k]) for k in _DECIMAL_CANDIDATE_FIELDS}} for c in candidates]}
 
 
 def auto_buy(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -319,6 +446,14 @@ def auto_buy(candidate: dict[str, Any]) -> dict[str, Any]:
             settings = db.get_settings(conn)
             if not settings["auto_paper"]:
                 raise TradeError("Auto-paper is disabled.")
+            if candidate.get("asset_type", "crypto") != "crypto" or settings["market_mode"] not in ("crypto", "both"):
+                raise TradeError("Automatic paper orders are restricted to crypto in the current market mode.")
+            scan_status = conn.execute("SELECT status FROM agents WHERE id='scanner'").fetchone()
+            saved = conn.execute("SELECT * FROM candidates WHERE asset_type='crypto' AND symbol=? AND chain=? AND pair_address=? AND observed_at=?", (candidate["symbol"], candidate["chain"], candidate["pair_address"], candidate["observed_at"])).fetchone()
+            if not scan_status or scan_status[0] == "error" or saved is None:
+                raise TradeError("Candidate is stale or superseded by a later scan; scan again.")
+            # Trust persisted scan data, not a caller-modified candidate payload.
+            candidate = dict(saved)
             if candidate["risk_status"] != "eligible" or D(candidate["liquidity_usd"]) < D(settings["min_liquidity"]) or D(candidate["volume_24h"]) < D(settings["min_volume"]):
                 raise TradeError("Candidate does not meet current thresholds.")
             equity, _ = db.marked_equity(conn)

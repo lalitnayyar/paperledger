@@ -23,6 +23,8 @@ DEFAULT_SETTINGS = {
     "take_profit_percent": 20.0,
     "auto_paper": False,
     "scan_interval_seconds": 300,
+    "market_mode": "crypto",
+    "stock_symbols": ["IBM"],
 }
 
 AGENTS = {
@@ -103,9 +105,16 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         conn.execute("BEGIN IMMEDIATE")
         candidate_columns = {row[1] for row in conn.execute("PRAGMA table_info(candidates)")}
-        for name in ("volume_spike_ratio", "pair_created_at"):
+        migrations = {
+            "volume_spike_ratio": "TEXT", "pair_created_at": "TEXT",
+            "asset_type": "TEXT NOT NULL DEFAULT 'crypto'",
+            "source": "TEXT NOT NULL DEFAULT 'DexScreener'",
+            "quote_date": "TEXT", "stock_volume_shares": "INTEGER",
+            "stock_change_percent": "TEXT",
+        }
+        for name, column_type in migrations.items():
             if name not in candidate_columns:
-                conn.execute(f"ALTER TABLE candidates ADD COLUMN {name} TEXT")
+                conn.execute(f"ALTER TABLE candidates ADD COLUMN {name} {column_type}")
         created = conn.execute("INSERT OR IGNORE INTO settings(id, data) VALUES (1, ?)", (json.dumps(DEFAULT_SETTINGS),)).rowcount
         conn.execute("INSERT OR IGNORE INTO account(id, cash) VALUES (1, ?)", (str(DEFAULT_SETTINGS["starting_balance"]),))
         for agent_id, (name, status, detail) in AGENTS.items():

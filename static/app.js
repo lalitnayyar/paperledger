@@ -2,7 +2,7 @@
   'use strict';
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
-  const state = { dashboard: null, llm: null, providerId: '', busy: new Set() };
+  const state = { dashboard: null, llm: null, providerId: '', marketData: null, marketDirty: false, marketSaving: false, watchlistDirty: false, watchlistSaving: false, busy: new Set() };
   const settingFields = ['starting_balance', 'risk_percent', 'max_position_percent', 'min_liquidity', 'min_volume', 'slippage_bps', 'fee_bps', 'stop_loss_percent', 'take_profit_percent', 'scan_interval_seconds'];
   const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const present = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
@@ -11,7 +11,7 @@
   const number = value => present(value) ? new Intl.NumberFormat('en-US', {maximumFractionDigits:18}).format(Number(value)) : '—';
   const date = value => { if (!value) return '—'; const d = new Date(value); return Number.isNaN(d.valueOf()) ? String(value) : d.toLocaleString(undefined, {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}); };
   const shortDate = value => { if (!value) return '—'; const d = new Date(value); return Number.isNaN(d.valueOf()) ? String(value) : d.toLocaleDateString(undefined, {month:'short',day:'numeric',year:'numeric'}); };
-  function notice(message, error = false) { const el = $('#notice'); el.textContent = message; el.classList.toggle('error', error); el.hidden = !message; }
+  function notice(message, error = false, warning = false) { const el = $('#notice'); el.textContent = message; el.classList.toggle('error', error); el.classList.toggle('warning', warning); el.hidden = !message; }
   function errorText(error) { return error instanceof Error ? error.message : String(error); }
   async function api(path, options = {}) {
     let response;
@@ -61,7 +61,21 @@
   }
   function renderCandidates(items) {
     items = Array.isArray(items) ? items : []; $('#candidates-empty').hidden = items.length > 0;
-    $('#candidates-body').innerHTML = items.map(item => { const url = safeUrl(item.url); const symbol = escapeHtml(item.symbol || '—'); return `<tr><td>${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><strong>${symbol} ↗</strong></a>` : `<strong>${symbol}</strong>`}<small title="${escapeHtml(item.pair_address || '')}">${escapeHtml(item.chain || '—')}${item.pair_address ? ` · ${escapeHtml(item.pair_address)}` : ''}</small>${item.observed_at ? `<small>Observed ${escapeHtml(date(item.observed_at))}</small>` : ''}</td><td>${price(item.price_usd)}</td><td>${present(item.price_change_24h) ? `${number(item.price_change_24h)}%` : '—'}</td><td>${money(item.liquidity_usd)}</td><td>${money(item.volume_24h)}</td><td>${present(item.volume_spike_ratio) ? `${number(item.volume_spike_ratio)}×` : '—'}</td><td><span class="risk-pill" title="${escapeHtml(item.reason || '')}">${escapeHtml(item.risk_status || '—')}</span>${item.reason ? `<small title="${escapeHtml(item.reason)}">${escapeHtml(item.reason)}</small>` : ''}</td></tr>`; }).join('');
+    const displayOrder = items.map((item, index) => ({item, index})).sort((a, b) => Number(b.item.asset_type === 'stock') - Number(a.item.asset_type === 'stock'));
+    $('#candidates-body').innerHTML = displayOrder.map(({item, index}) => {
+      const stock = item.asset_type === 'stock';
+      const url = safeUrl(item.url), symbol = escapeHtml(item.symbol || '—');
+      const source = escapeHtml(item.source || (stock ? 'Alpha Vantage' : 'DexScreener'));
+      const asset = `${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><strong>${symbol} ↗</strong></a>` : `<strong>${symbol}</strong>`}<small>${stock ? 'STOCK' : 'CRYPTO'} · Source: ${source}</small>${!stock ? `<small title="${escapeHtml(item.pair_address || '')}">${escapeHtml(item.chain || '—')}${item.pair_address ? ` · ${escapeHtml(item.pair_address)}` : ''}</small>` : ''}`;
+      const quote = stock ? `<small>Trading day: ${escapeHtml(item.quote_date || 'Unavailable')}</small>` : item.observed_at ? `<small>Observed ${escapeHtml(date(item.observed_at))}</small>` : '';
+      const change = stock ? `${present(item.stock_change_percent) ? `${number(item.stock_change_percent)}%` : '—'}<small>Close-to-close</small>` : `${present(item.price_change_24h) ? `${number(item.price_change_24h)}%` : '—'}<small>24h</small>`;
+      const liquidity = stock ? '—<small>Not assessed</small>' : `${money(item.liquidity_usd)}<small>USD</small>`;
+      const volume = stock ? `${number(item.stock_volume_shares)}<small>Shares · quote day</small>` : `${money(item.volume_24h)}<small>USD · 24h</small>`;
+      const trend = stock ? '—' : `${present(item.volume_spike_ratio) ? `${number(item.volume_spike_ratio)}×` : '—'}<small>1h vs prior 23h avg</small>`;
+      const review = stock ? '<span class="risk-pill">Not assessed</span><small>No stock liquidity or rug assessment</small>' : `<span class="risk-pill" title="${escapeHtml(item.reason || '')}">${escapeHtml(item.risk_status || '—')}</span>${item.reason ? `<small title="${escapeHtml(item.reason)}">${escapeHtml(item.reason)}</small>` : ''}`;
+      const action = stock && item.symbol && present(item.price_usd) && Number(item.price_usd) > 0 ? `<button class="text-button quote-button" type="button" data-use-quote="${index}" aria-label="Use quote for ${symbol} in the ledger">Use quote <svg><use href="#i-arrow"/></svg></button>` : '';
+      return `<tr><td>${asset}${action}</td><td>${price(item.price_usd)}${quote}</td><td>${change}</td><td>${liquidity}</td><td>${volume}</td><td>${trend}</td><td>${review}</td></tr>`;
+    }).join('');
   }
   function renderPositions(items) {
     if (document.activeElement && document.activeElement.matches('.mark-form input')) return;
@@ -76,6 +90,35 @@
     items = Array.isArray(items) ? items : []; $('#activity-empty').hidden = items.length > 0;
     $('#activity-list').innerHTML = items.slice(0, 8).map(item => `<div class="activity-item"><span class="activity-dot ${/error|fail/i.test(item.level || '') ? 'error' : /warn/i.test(item.level || '') ? 'warning' : ''}"></span><div class="activity-message">${escapeHtml(item.message || '—')}<small>${escapeHtml(item.agent || 'System')}</small></div><time class="activity-time">${escapeHtml(date(item.timestamp))}</time></div>`).join('');
   }
+  const marketNames = {stocks:'Stocks', crypto:'Crypto', both:'Both'};
+  function renderMarketSelection(settings, available) {
+    const form = $('#market-form'), saved = marketNames[settings.market_mode] ? settings.market_mode : 'crypto';
+    if (available && !state.marketDirty && !state.marketSaving) form.elements.market_mode.value = saved;
+    const selected = form.elements.market_mode.value;
+    $('#market-options').disabled = !available || state.marketSaving;
+    $('button[type=submit]', form).disabled = !available || state.marketSaving || !state.marketDirty;
+    $('#market-current').textContent = !available ? 'Market selection unavailable.' : state.marketDirty && selected !== saved ? `Current: ${marketNames[saved]} · ${marketNames[selected]} not saved` : `Current: ${marketNames[saved]}`;
+  }
+  function renderWatchlist(settings, available) {
+    const form = $('#stock-symbols-form');
+    form.elements.stock_symbols.disabled = !available || state.watchlistSaving;
+    $('button[type=submit]', form).disabled = !available || state.watchlistSaving;
+    if (available && !state.watchlistDirty && !state.watchlistSaving) form.elements.stock_symbols.value = (Array.isArray(settings.stock_symbols) ? settings.stock_symbols : ['IBM']).join(', ');
+  }
+  function renderMarketData(data) {
+    state.marketData = data;
+    const provider = data.stock_provider || 'Alpha Vantage';
+    $('#market-data-status').textContent = data.using_demo ? `${provider} · Demo mode: IBM only (no key configured).` : data.has_api_key ? `${provider} · API key saved; never displayed.` : `${provider} · No API key saved.`;
+    $('#clear-market-key').disabled = !data.has_api_key;
+  }
+  function warningMessages(data) {
+    return Array.isArray(data?.warnings) ? data.warnings.map(item => typeof item === 'string' ? item : item?.message || item?.detail || JSON.stringify(item)).filter(Boolean) : [];
+  }
+  function showScanWarnings(warnings) {
+    const el = $('#scan-warnings');
+    el.textContent = warnings.length ? `Scanner notices — results may be incomplete:\n${warnings.map(message => `• ${message}`).join('\n')}` : '';
+    el.hidden = !warnings.length;
+  }
   function renderDashboard(data, preserveSettings = false) {
     state.dashboard = data; const s = data.summary || {};
     setValue('#metric-equity', money(s.equity)); setValue('#metric-cash', money(s.cash)); setPnl('#metric-realized', s.realized_pnl); setValue('#metric-positions', number(s.open_positions));
@@ -84,7 +127,8 @@
     renderChart(data.equity_curve); renderAgents(data.agents); renderCandidates(data.candidates); renderPositions(data.positions); renderTrades(data.trades); renderActivity(data.activity);
     const settings = data.settings || {}; const hasAuto = typeof settings.auto_paper === 'boolean';
     const toggle = $('#auto-toggle'); toggle.disabled = !hasAuto; toggle.setAttribute('aria-checked', String(hasAuto && settings.auto_paper));
-    $('#auto-description').textContent = !hasAuto ? 'Setting unavailable' : settings.auto_paper ? 'Enabled · manual cycles only' : 'Blocked · manual cycles only';
+    $('#auto-description').textContent = !hasAuto ? 'Setting unavailable' : settings.auto_paper ? 'Enabled · eligible crypto, manual cycles only' : 'Blocked · manual cycles only';
+    renderMarketSelection(settings, !!data.settings); renderWatchlist(settings, !!data.settings);
     if (!preserveSettings) { const form = $('#settings-form'); settingFields.forEach(key => { form.elements[key].value = settings[key] ?? ''; }); form.elements.auto_paper.checked = !!settings.auto_paper; }
   }
   function renderProviders(data) {
@@ -105,26 +149,102 @@
   }
   async function refreshDashboard(preserveSettings = false) { const data = await api('/api/dashboard'); renderDashboard(data, preserveSettings); setConnection(true); return data; }
   async function refreshProviders() { const data = await api('/api/llm'); renderProviders(data); return data; }
+  async function refreshMarketData() { const data = await api('/api/market-data'); renderMarketData(data); return data; }
   async function refreshAfterMutation(fn) { try { await fn(); } catch (e) { throw new Error(`Action completed, but refresh failed. Verify the result before retrying. ${errorText(e)}`); } }
   async function refreshAll(showSuccess = false) {
-    const results = await Promise.allSettled([refreshDashboard(), refreshProviders(), api('/api/health')]);
+    const results = await Promise.allSettled([refreshDashboard(), refreshProviders(), api('/api/health'), refreshMarketData()]);
+    if (results[3].status === 'rejected') { $('#market-data-status').textContent = 'Stock provider settings unavailable.'; $('#clear-market-key').disabled = true; }
     if (results[0].status === 'rejected') { setConnection(false); notice(`Dashboard unavailable: ${errorText(results[0].reason)}`, true); }
     else if (results[1].status === 'rejected') notice(`Provider settings unavailable: ${errorText(results[1].reason)}`, true);
     else if (results[2].status === 'rejected') { setConnection(false); notice(`Health check unavailable: ${errorText(results[2].reason)}`, true); }
+    else if (results[3].status === 'rejected') notice(`Stock provider settings unavailable: ${errorText(results[3].reason)}`, true);
     else if (showSuccess) notice('Data refreshed.');
     else notice('');
   }
   async function runAction(button, task, success) {
     if (button.disabled) return; button.disabled = true;
-    try { await task(); notice(success); } catch (e) { notice(errorText(e), true); } finally { button.disabled = false; }
+    try { const result = await task(); const warnings = warningMessages(result); notice(warnings.length ? `${success} Warnings: ${warnings.join(' · ')}` : success, false, warnings.length > 0); } catch (e) { notice(errorText(e), true); } finally { button.disabled = false; }
   }
   $$('.nav-link').forEach(button => button.addEventListener('click', () => { const page = button.dataset.page; $$('.page').forEach(el => { el.hidden = el.id !== `page-${page}`; }); $$('.nav-link').forEach(el => { const active = el === button; el.classList.toggle('active', active); if (active) el.setAttribute('aria-current','page'); else el.removeAttribute('aria-current'); }); $('#breadcrumb-page').textContent = page.toUpperCase(); window.scrollTo(0,0); }));
   function updateThemeButton() { const light = document.documentElement.dataset.theme === 'light'; $('#theme-toggle').setAttribute('aria-label', light ? 'Switch to dark mode' : 'Switch to light mode'); }
   updateThemeButton(); $('#theme-toggle').addEventListener('click', () => { const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = theme; try { localStorage.setItem('ledger-six-theme', theme); } catch (_) {} updateThemeButton(); });
   $('#refresh-button').addEventListener('click', async event => { const button = event.currentTarget; button.disabled = true; try { await refreshAll(true); } finally { button.disabled = false; } });
-  $$('[data-action]').forEach(button => button.addEventListener('click', () => runAction(button, async () => { await api(`/api/${button.dataset.action}`, {method:'POST'}); await refreshAfterMutation(() => refreshDashboard(true)); }, button.dataset.action === 'scan' ? 'Scanner completed.' : 'Paper cycle completed.')));
+  $$('[data-action]').forEach(button => button.addEventListener('click', () => {
+    if (state.marketDirty || state.marketSaving) { notice('Save the market selection before running the scanner or cycle.', true); return; }
+    return runAction(button, async () => { const result = await api(`/api/${button.dataset.action}`, {method:'POST'}); showScanWarnings(warningMessages(result)); await refreshAfterMutation(() => refreshDashboard(true)); return result; }, button.dataset.action === 'scan' ? 'Scanner completed.' : 'Paper cycle completed.');
+  }));
+  $('#market-form').addEventListener('change', event => {
+    if (event.target.name !== 'market_mode') return;
+    const saved = state.dashboard?.settings?.market_mode || 'crypto';
+    state.marketDirty = event.currentTarget.elements.market_mode.value !== saved;
+    renderMarketSelection(state.dashboard?.settings || {}, !!state.dashboard?.settings);
+  });
+  $('#market-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const mode = event.currentTarget.elements.market_mode.value;
+    if (!marketNames[mode] || !state.marketDirty || state.marketSaving) return;
+    state.marketSaving = true; renderMarketSelection(state.dashboard?.settings || {}, !!state.dashboard?.settings);
+    try {
+      await api('/api/settings', json('PUT', {market_mode:mode}));
+      state.marketDirty = false;
+      if (state.dashboard?.settings) state.dashboard.settings.market_mode = mode;
+      await refreshAfterMutation(() => refreshDashboard(true));
+      notice(`Markets set to ${marketNames[mode]}.`);
+    } catch (e) { notice(errorText(e), true); }
+    finally { state.marketSaving = false; renderMarketSelection(state.dashboard?.settings || {}, !!state.dashboard?.settings); }
+  });
+  $('#stock-symbols-form').addEventListener('input', () => { state.watchlistDirty = true; });
+  $('#stock-symbols-form').addEventListener('submit', event => {
+    event.preventDefault();
+    const form = event.currentTarget, symbols = form.elements.stock_symbols.value.split(',').map(symbol => symbol.trim().toUpperCase()).filter(Boolean);
+    if (!symbols.length || symbols.length > 20) { notice('The stock watchlist must contain 1 to 20 symbols.', true); return; }
+    if (symbols.some(symbol => !/^[A-Z]{1,5}(?:[.-][A-Z]{1,4})?$/.test(symbol))) { notice('Use US ticker syntax, such as IBM or BRK.B.', true); return; }
+    if (new Set(symbols).size !== symbols.length) { notice('The stock watchlist cannot contain duplicate symbols.', true); return; }
+    runAction($('button[type=submit]', form), async () => {
+      state.watchlistSaving = true; renderWatchlist(state.dashboard?.settings || {}, !!state.dashboard?.settings);
+      try {
+        await api('/api/settings', json('PUT', {stock_symbols:symbols}));
+        state.watchlistDirty = false;
+        if (state.dashboard?.settings) state.dashboard.settings.stock_symbols = symbols;
+        await refreshAfterMutation(() => refreshDashboard(true));
+      } finally { state.watchlistSaving = false; renderWatchlist(state.dashboard?.settings || {}, !!state.dashboard?.settings); }
+    }, 'Stock watchlist saved.');
+  });
+  $('#market-data-form').addEventListener('submit', event => {
+    event.preventDefault();
+    const form = event.currentTarget, key = form.elements.api_key.value.trim();
+    if (!key) { notice('Enter a new Alpha Vantage API key to save it.', true); return; }
+    runAction($('button[type=submit]', form), async () => {
+      await api('/api/market-data', json('PUT', {api_key:key}));
+      form.elements.api_key.value = '';
+      await refreshAfterMutation(refreshMarketData);
+    }, 'Stock market data key saved.');
+  });
+  $('#clear-market-key').addEventListener('click', async event => {
+    const button = event.currentTarget;
+    await runAction(button, async () => {
+      await api('/api/market-data', json('PUT', {clear_key:true}));
+      $('#market-data-form').elements.api_key.value = '';
+      await refreshAfterMutation(refreshMarketData);
+    }, 'Stock market data key cleared.');
+    button.disabled = !state.marketData?.has_api_key;
+  });
+  $('#candidates-body').addEventListener('click', event => {
+    const button = event.target.closest('[data-use-quote]');
+    if (!button || !event.currentTarget.contains(button)) return;
+    const candidate = state.dashboard?.candidates?.[Number(button.dataset.useQuote)];
+    if (!candidate || candidate.asset_type !== 'stock' || !candidate.symbol || !present(candidate.price_usd) || Number(candidate.price_usd) <= 0) { notice('That stock quote is no longer available. Refresh and try again.', true); return; }
+    const form = $('#trade-form');
+    form.reset(); form.elements.symbol.value = candidate.symbol; form.elements.asset_type.value = 'stock'; form.elements.price.value = String(candidate.price_usd);
+    const prefill = $('#quote-prefill');
+    prefill.textContent = `Prefilled ${candidate.symbol} from trading day ${candidate.quote_date || 'unavailable'}. This quote may be stale; verify it, then enter quantity and reason and submit manually.`;
+    prefill.hidden = false;
+    $('[data-page="ledger"]').click(); form.elements.quantity.focus();
+  });
+  $('#trade-form').addEventListener('input', event => { if (['symbol', 'asset_type', 'price'].includes(event.target.name)) $('#quote-prefill').hidden = true; });
+  $('#trade-form').addEventListener('change', event => { if (['symbol', 'asset_type', 'price'].includes(event.target.name)) $('#quote-prefill').hidden = true; });
   $('#auto-toggle').addEventListener('click', event => { const button = event.currentTarget; const next = button.getAttribute('aria-checked') !== 'true'; runAction(button, async () => { await api('/api/settings', json('PUT', {auto_paper:next})); await refreshAfterMutation(() => refreshDashboard()); }, next ? 'Automatic paper execution enabled.' : 'Automatic paper execution stopped.'); });
-  $('#trade-form').addEventListener('submit', event => { event.preventDefault(); const form = event.currentTarget, submit = $('button[type=submit]', form); const data = Object.fromEntries(new FormData(form)); data.symbol = data.symbol.trim().toUpperCase(); data.reason = data.reason.trim(); data.quantity = Number(data.quantity); data.price = Number(data.price); if (!data.symbol || !data.reason) { notice('Symbol and reason are required.', true); return; } runAction(submit, async () => { await api('/api/trades', json('POST',data)); form.reset(); await refreshAfterMutation(() => refreshDashboard(true)); }, 'Paper trade recorded.'); });
+  $('#trade-form').addEventListener('submit', event => { event.preventDefault(); const form = event.currentTarget, submit = $('button[type=submit]', form); const data = Object.fromEntries(new FormData(form)); data.symbol = data.symbol.trim().toUpperCase(); data.reason = data.reason.trim(); data.quantity = Number(data.quantity); data.price = Number(data.price); if (!data.symbol || !data.reason) { notice('Symbol and reason are required.', true); return; } runAction(submit, async () => { await api('/api/trades', json('POST',data)); form.reset(); $('#quote-prefill').hidden = true; await refreshAfterMutation(() => refreshDashboard(true)); }, 'Paper trade recorded.'); });
   $('#positions-body').addEventListener('submit', event => { if (!event.target.matches('.mark-form')) return; event.preventDefault(); const form = event.target; runAction($('button', form), async () => { await api(`/api/positions/${encodeURIComponent(form.dataset.id)}/mark`, json('PATCH',{price:Number(form.elements.price.value)})); if (form.contains(document.activeElement)) document.activeElement.blur(); await refreshAfterMutation(() => refreshDashboard(true)); }, 'Mark price updated.'); });
   $('#settings-form').addEventListener('submit', event => { event.preventDefault(); const form = event.currentTarget; const data = {}; settingFields.forEach(key => { data[key] = Number(form.elements[key].value); }); data.auto_paper = form.elements.auto_paper.checked; runAction($('button[type=submit]',form), async () => { await api('/api/settings',json('PUT',data)); await refreshAfterMutation(() => refreshDashboard()); }, 'Trading settings saved.'); });
   $('#provider-select').addEventListener('change', event => { state.providerId = event.target.value; fillProvider(); });

@@ -20,15 +20,15 @@ These screenshots were captured from the application in a sandbox. The example b
 
 ### Stock and crypto ledger
 
-![Paper ledger showing an illustrative stock position, trade history and mark-price controls](docs/screenshots/ledger.png)
+![Paper ledger showing an example stock quote prefilled for manual review](docs/screenshots/ledger.png)
 
-### Risk and LLM settings
+### Risk and stock scanner settings
 
-![Risk settings and configurable LLM provider controls](docs/screenshots/settings.png)
+![Risk settings and stock watchlist and data-provider controls](docs/screenshots/settings.png)
 
-### Token scanner
+### Stocks and crypto scanner
 
-![Scanner showing a time-specific market-data snapshot and basic threshold results](docs/screenshots/scanner.png)
+![Stock and crypto scanner showing a time-specific market-data snapshot](docs/screenshots/scanner.png)
 
 ### Light theme
 
@@ -40,8 +40,8 @@ These screenshots were captured from the application in a sandbox. The example b
 - Values and fills in this application are simulations. They are not evidence of live execution, executable prices, exchange liquidity, realistic gas, taxes, market impact, or achievable returns.
 - The token scanner uses public DEX Screener market information. A recently published token profile is not necessarily a newly created token or pair. Public data can be delayed, incomplete, manipulated, rate-limited, or unavailable.
 - The liquidity and volume checks are **basic filters, not a smart-contract security audit**. They cannot detect every honeypot, malicious contract, token tax, or rug pull. A token passing the filters is not certified safe.
-- Stocks are tracked in the same paper ledger. Stock orders and marks use prices entered by the user; there is no stock-market price feed or brokerage synchronization.
-- There is **no continuous trading worker**. The scanner and paper cycle run only when you click their buttons. Enabling automatic paper execution allows a manually triggered cycle to simulate up to three buys; it does not schedule cycles. The scan-interval field is reserved for a future version. Stop-loss is only a sizing assumption and take-profit is advisory: neither automatically closes positions.
+- The stock scanner uses Alpha Vantage end-of-day quotes for a configurable watchlist of US-listed, USD-priced stocks. Quotes can be delayed or stale, do not verify liquidity or safety, and are not automatically used as position marks. Stock paper trades remain manual; there is no brokerage synchronization.
+- There is **no continuous trading worker**. The scanner and paper cycle run only when you click their buttons. Enabling automatic paper execution allows a manually triggered cycle to simulate up to three eligible **crypto** buys; stocks are not automatically bought. It does not schedule cycles. The scan-interval field is reserved for a future version. Stop-loss is only a sizing assumption and take-profit is advisory: neither automatically closes positions.
 - Manual buys have no mark until you enter one. Total equity and unrealized P&L are unavailable while any holding is unmarked; older chart points may still appear. Even a recorded mark can be stale. For crypto, symbols are not unique across chains and contracts; this simple ledger groups positions by symbol and asset type, so do not combine distinct tokens that share the same symbol.
 - AI provider responses are advisory and may be wrong. The six stages are programmatic workflow stages; they are not six independent autonomous LLMs. LLM responses cannot place live trades.
 - The server is designed for a **single trusted user on a local computer**, without login or multi-user authorization. The included Compose file binds it to `127.0.0.1` only. Do not expose the port, reverse proxy, or Docker network to untrusted users. Custom provider URLs can access network destinations available to the container, so only configure trusted endpoints. For remote access or multi-user use, authentication, TLS, network restrictions, secret management, and an independent security review are required.
@@ -49,7 +49,7 @@ These screenshots were captured from the application in a sandbox. The example b
 ## Requirements
 
 - Docker Engine or Docker Desktop with Docker Compose v2.
-- Internet access for image builds, the token scanner, and cloud model calls. A local Ollama model can run without an internet connection once installed.
+- Internet access for image builds, stock and token scanners, and cloud model calls. A local Ollama model can run without an internet connection once installed.
 - A computer that stays powered on while you use the app. Stopping the container stops background tasks. Persistent data is kept in a Docker volume.
 
 ## Start with Docker
@@ -88,7 +88,7 @@ For a direct non-interactive deployment with the default port:
    ```
 
 4. Open **http://127.0.0.1:8080** on the same computer. Change `APP_PORT` in `.env` before starting if 8080 is occupied.
-5. Start in paper mode. Set a starting balance and risk parameters, then enter your own sample stock trade or scan the token feed. A paper balance is not real money.
+5. Start in paper mode. Set a starting balance and risk parameters, choose **Stocks**, **Crypto**, or **Both** on the dashboard, and run the scanner. A paper balance is not real money.
 
 Useful commands:
 
@@ -112,6 +112,14 @@ bash manage.sh
 On Windows, use WSL with Docker Desktop integration or Git Bash with Docker Desktop running. The menu can install and rebuild, pull from an existing Git checkout, show the current version and health, start/stop/restart the service, view and export logs, choose or find an available local port, back up or restore data, and remove the application. Option **9** changes the port; apply it by choosing install/build/start. Option **14** exports all Compose-project container logs into one private file under `backups/log-exports/` and prints its path. Clean removal preserves data; the separate full-deletion option requires typing `DELETE DATA`. Both preserve `.env` and the `backups/` directory. Exported logs may contain sensitive information; review them before sharing.
 
 The menu's backups are stored under `backups/` with restricted permissions where the filesystem supports them. They can contain private ledger data and the generated encryption key. Restore accepts **trusted archives only**, requires typing `RESTORE DATA`, and creates a backup of the existing volume before replacing it. A failed restore keeps the application stopped and reports the pre-restore backup location. The menu does not include `.env` or externally supplied encryption keys in its archive; back them up separately. Do not run concurrent administration or other writers against the volume. Backups use an `alpine:3.20` helper image, which Docker may need to download.
+
+### Stocks, crypto, or both
+
+Use the market selector on the dashboard to choose **Stocks**, **Crypto**, or **Both**, select **Save selection**, then select **Run scanner**. The choice is saved. Crypto uses recently profiled DEX Screener tokens; its liquidity and volume checks are not a contract audit. Stock results come from a configurable list of US-listed, USD-priced symbols using Alpha Vantage's `GLOBAL_QUOTE` endpoint. A stock result includes its latest trading day and trading volume in shares, not token liquidity or 24-hour dollar volume.
+
+The default stock watchlist contains `IBM`, which can be tested with the provider's public demo key. To scan your own symbols, obtain an [Alpha Vantage API key](https://www.alphavantage.co/support/#api-key), add it in **Settings**, and edit the stock watchlist. The service is rate-limited: each symbol uses one API request per scan, and Alpha Vantage currently documents 25 requests per day on its standard free tier for most datasets; check the provider for current limits and terms. If one source is unavailable in **Both** mode, review any warnings and the observation dates rather than assuming both scans succeeded.
+
+Alpha Vantage's default quote is historical/end-of-day, **not a live price**. Market closures, provider updates, or network problems can make it older. Check the quote date before using it. A stock quote can prefill a manual paper order, but it is never submitted without your action and is not automatically used to buy or mark a stock holding. No scan runs in the background.
 
 ### Local Ollama
 
@@ -193,5 +201,6 @@ On Windows, activate with `.venv\Scripts\Activate.ps1` and set `$env:DATA_DIR = 
 ## References
 
 - [DEX Screener API reference](https://docs.dexscreener.com/api/reference)
+- [Alpha Vantage quote endpoint](https://www.alphavantage.co/documentation/#latestprice)
 - [Ollama OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility)
 - [Ollama cloud models](https://ollama.com/blog/cloud-models)
