@@ -1,0 +1,25 @@
+# Terminal Full Output
+# Terminal: default
+# Command: python3 - <<'PY'
+import os,json,urllib.request
+u=os.environ['OPENAI_API_BASE'].rstrip('/')+'/chat/completions'
+r=urllib.request.Request(u,method='POST',headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['OPENAI_API_KEY']},data=json.dumps({'model':'gemini-3.8-flash','messages':[{'role':'user','content':'Reply with OK.'}],'max_tokens':128}).encode())
+with urllib.request.urlopen(r,timeout=60) as q: d=json.load(q)
+choice=d.get('choices',[{}])[0]
+print('Content:',repr(choice.get('message',{}).get('content')),'finish:',choice.get('finish_reason'),'usage:',d.get('usage'))
+PY
+# PID: 1145
+# Timestamp: 2026-11-08_16-21-44.978702
+# Original Length: 1049 characters
+# ----------------------------------------
+
+[32mubuntu@sandbox:~/tradeledger$ [0mpython3 - <<'PY'
+import os,json,urllib.request
+u=os.environ['OPENAI_API_BASE'].rstrip('/')+'/chat/completions'
+r=urllib.request.Request(u,method='POST',headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['OPENAI_API_KEY']},data=json.dumps({'model':'gemini-3.8-flash','messages':[{'role':'user','content':'Reply with OK.'}],'max_tokens':128}).encode())
+with urllib.request.urlopen(r,timeout=60) as q: d=json.load(q)
+choice=d.get('choices',[{}])[0]
+print('Content:',repr(choice.get('message',{}).get('content')),'finish:',choice.get('finish_reason'),'usage:',d.get('usage'))
+PY
+Content: 'OK.' finish: stop usage: {'completion_tokens': 2, 'completion_tokens_details': {'reasoning_tokens': 115, 'accepted_prediction_tokens': 0, 'rejected_prediction_tokens': 0, 'completion_tokens_modality': {'text': 2}}, 'prompt_tokens': 4, 'prompt_tokens_details': {'prompt_tokens_modality': {'text': 4}}, 'total_tokens': 6, 'traffic_type': 'on_demand_offpeak'}
+[32mubuntu@sandbox:~/tradeledger$ [0m
