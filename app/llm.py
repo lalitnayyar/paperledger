@@ -164,9 +164,50 @@ def _private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return any(ip.version == net.version and ip in net for net in _PRIVATE_NETWORKS)
 
 
+def _url_origin(value: str) -> tuple[str, str, int] | None:
+    """Canonicalize an origin without DNS; reject malformed saved URLs.
+
+    The empty URL is an unconfigured destination, not a wildcard origin.
+    Use HTTPX's wire hostname for IDNs so that distinct destinations are not
+    collapsed by Python's different IDNA codec. Preserve a trailing DNS dot:
+    HTTP virtual hosts may distinguish it even if DNS resolves it identically.
+    """
+    if value == "":
+        return None
+    try:
+        if (not isinstance(value, str) or len(value) > 2048
+                or any(ord(c) < 33 or ord(c) == 127 for c in value) or "\\" in value):
+            raise ValueError
+        parts = urlsplit(value)
+        host, port = parts.hostname, parts.port
+        if (parts.scheme not in ("http", "https") or not host or not parts.netloc
+                or parts.username is not None or parts.password is not None
+                or parts.query or parts.fragment or "%" in host or parts.netloc.endswith(":")):
+            raise ValueError
+        wire_host = httpx.URL(value).raw_host.decode("ascii").lower()
+        try:
+            wire_host = str(ipaddress.ip_address(wire_host))
+        except ValueError:
+            dns_host = wire_host[:-1] if wire_host.endswith(".") else wire_host
+            labels = dns_host.split(".")
+            if len(dns_host) > 253 or any(
+                not re.fullmatch(r"[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?", label)
+                for label in labels
+            ):
+                raise ValueError
+        effective_port = port if port is not None else (443 if parts.scheme == "https" else 80)
+        return parts.scheme, wire_host, effective_port
+    except (ValueError, UnicodeError, TypeError, httpx.InvalidURL):
+        raise ValueError("Invalid provider URL origin") from None
+
+
 def _validate_url(value: str) -> str:
     if not value:
         return ""
+    try:
+        _url_origin(value)
+    except ValueError:
+        raise HTTPException(422, "Invalid provider base URL.") from None
     if len(value) > 2048 or any(ord(c) < 33 or ord(c) == 127 for c in value) or "\\" in value:
         raise HTTPException(422, "Invalid provider base URL.")
     try:
@@ -206,7 +247,7 @@ def _validate_url(value: str) -> str:
         if parsed_ip:
             raise HTTPException(422, "HTTP is allowed only for local or private-network providers.")
         try:
-            addresses = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, port or 80, type=socket.SOCK_STREAM)}
+            addresses = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, port if port is not None else 80, type=socket.SOCK_STREAM)}
         except (OSError, ValueError):
             addresses = set()
         if not addresses or not all(_private_ip(addr) for addr in addresses):
@@ -220,7 +261,7 @@ def _validate_url(value: str) -> str:
         val = os.environ.get(variable, "")
         if val.isdecimal() and 0 < int(val) <= 65535:
             blocked.add(int(val))
-    effective_port = port or (443 if parts.scheme == "https" else 80)
+    effective_port = port if port is not None else (443 if parts.scheme == "https" else 80)
     if local and effective_port in blocked:
         raise HTTPException(422, "Provider URL points to a blocked application port.")
     if not local and not parsed_ip and effective_port in blocked:
@@ -335,6 +376,14 @@ async def put_provider(provider_id: str, request: Request) -> dict[str, Any]:
             values = {"id": provider_id, "name": provider_id, "kind": "openai",
                       "base_url": "", "model": "", "enabled": 1, "encrypted_key": None}
         values.update(changes)
+        if row and row["encrypted_key"] and not body.get("clear_key") and not api_key:
+            try:
+                old_origin = _url_origin(row["base_url"])
+                new_origin = _url_origin(values["base_url"])
+            except ValueError:
+                raise HTTPException(409, "Cannot verify the provider URL; replace or clear the saved API key.") from None
+            if row["kind"] != values["kind"] or old_origin != new_origin:
+                raise HTTPException(409, "Changing provider kind or URL origin requires replacing or clearing the saved API key.")
         if body.get("clear_key"):
             values["encrypted_key"] = None
         elif api_key:

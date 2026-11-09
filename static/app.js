@@ -3,6 +3,35 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
   const state = { dashboard: null, llm: null, providerId: '', marketData: null, marketDirty: false, marketSaving: false, watchlistDirty: false, watchlistSaving: false, importSaving: false, scanRunning: false, scanWarnings: [] };
+  let session = null;
+  let authLost = false;
+  function redirectToLogin() {
+    if (authLost) return;
+    authLost = true;
+    session = null;
+    state.dashboard = null; state.llm = null; state.marketData = null;
+    $('.app-shell').hidden = true;
+    $('#session-loading').hidden = false;
+    $('#session-loading').textContent = 'Your session has ended. Redirecting to sign in…';
+    try { sessionStorage.removeItem('ledger-six-scanner-drafts-v1'); sessionStorage.removeItem('ledger-six-scan-warnings-v1'); } catch (_) {}
+    window.location.replace('/login');
+  }
+  const sessionReady = (async () => {
+    let response;
+    try { response = await fetch('/api/auth/session', {cache:'no-store'}); }
+    catch (_) { throw new Error('Cannot verify your session. Check your connection and reload.'); }
+    if (response.status === 401) { redirectToLogin(); throw new Error('Your session has ended.'); }
+    if (!response.ok) throw new Error('Cannot verify your session. Please reload and try again.');
+    let data;
+    try { data = await response.json(); } catch (_) { throw new Error('Cannot verify your session. Please reload and try again.'); }
+    if (!data || typeof data.username !== 'string' || !['admin','user'].includes(data.role) || typeof data.csrf !== 'string') throw new Error('Cannot verify your session. Please reload and try again.');
+    session = data;
+    return data;
+  })();
+  const isAdmin = () => session?.role === 'admin';
+  const isLocalTestMode = () => session?.csrf === '';
+  window.addEventListener('pagehide', () => { $('.app-shell').hidden = true; });
+  window.addEventListener('pageshow', event => { if (event.persisted) window.location.reload(); });
   const settingFields = ['starting_balance', 'risk_percent', 'max_position_percent', 'min_liquidity', 'min_volume', 'slippage_bps', 'fee_bps', 'stop_loss_percent', 'take_profit_percent', 'scan_interval_seconds'];
   const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const present = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
@@ -20,16 +49,24 @@
   function notice(message, error = false, warning = false) { const el = $('#notice'); el.textContent = message; el.classList.toggle('error', error); el.classList.toggle('warning', warning); el.hidden = !message; }
   function errorText(error) { return error instanceof Error ? error.message : String(error); }
   async function api(path, options = {}) {
+    await sessionReady;
+    if (authLost) throw new Error('Your session has ended.');
+    const method = String(options.method || 'GET').toUpperCase();
+    const headers = new Headers(options.headers || {});
+    if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+    if (!['GET','HEAD','OPTIONS'].includes(method)) headers.set('X-CSRF-Token', session.csrf);
     let response;
-    try { response = await fetch(path, { ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } }); }
+    try { response = await fetch(path, { ...options, headers }); }
     catch (_) { throw new Error('Cannot reach the application server. Check the connection and try again.'); }
+    if (response.status === 401) { redirectToLogin(); throw new Error('Your session has ended.'); }
+    if (authLost) throw new Error('Your session has ended.');
     const raw = await response.text(); let data = {};
     if (raw) { try { data = JSON.parse(raw); } catch (_) { if (!response.ok) throw new Error(`Request failed (${response.status}).`); throw new Error('The server returned an invalid response.'); } }
     if (!response.ok) {
       const detail = data.detail ?? data.error ?? data.message;
       const scannerRequest = /^\/api\/(?:scan|cycle)(?:\?|$)/.test(path);
       const message = typeof detail === 'string' ? (scannerRequest ? safeScannerMessage(detail) : detail) : `Request failed (${response.status}).`;
-      throw new Error(message);
+      const error = new Error(message); error.status = response.status; throw error;
     }
     return data;
   }
@@ -127,18 +164,22 @@
     const form = $('#market-form'), saved = marketNames[settings.market_mode] ? settings.market_mode : '';
     if (available && !state.marketDirty && !state.marketSaving) form.elements.market_mode.value = saved;
     const selected = form.elements.market_mode.value;
-    $('#market-options').disabled = !available || state.marketSaving || state.scanRunning;
-    $('button[type=submit]', form).disabled = !available || state.marketSaving || state.scanRunning || !state.marketDirty;
-    $('#market-current').textContent = !available || !saved ? 'Saved market selection unavailable.' : state.marketDirty ? `Saved: ${marketNames[saved]} · ${marketNames[selected] || 'Selection'} not saved` : `Saved: ${marketNames[saved]}`;
+    $('#market-options').disabled = !isAdmin() || !available || state.marketSaving || state.scanRunning;
+    $('button[type=submit]', form).disabled = !isAdmin() || !available || state.marketSaving || state.scanRunning || !state.marketDirty;
+    $('#market-current').textContent = !available || !saved ? 'Saved market selection unavailable.' : !isAdmin() ? `Saved: ${marketNames[saved]} · Only administrators can change this.` : state.marketDirty ? `Saved: ${marketNames[saved]} · ${marketNames[selected] || 'Selection'} not saved` : `Saved: ${marketNames[saved]}`;
   }
   function renderWatchlist(settings, available) {
     const form = $('#stock-symbols-form');
-    form.elements.stock_symbols.disabled = !available || state.watchlistSaving || state.scanRunning;
-    $('button[type=submit]', form).disabled = !available || state.watchlistSaving || state.scanRunning || !state.watchlistDirty;
+    form.elements.stock_symbols.disabled = !isAdmin() || !available || state.watchlistSaving || state.scanRunning;
+    $('button[type=submit]', form).disabled = !isAdmin() || !available || state.watchlistSaving || state.scanRunning || !state.watchlistDirty;
     if (available && !state.watchlistDirty && !state.watchlistSaving) form.elements.stock_symbols.value = (Array.isArray(settings.stock_symbols) ? settings.stock_symbols : []).join(', ');
     $('#stock-settings-status').textContent = !available ? 'Saved watchlist unavailable.' : state.watchlistDirty ? 'Watchlist has unsaved changes. Save or revert before scanning or running a cycle.' : 'Watchlist saved. Scans use this Alpha Vantage list.';
   }
   function renderStockContext() {
+    if (!isAdmin()) {
+      $('#stock-scan-context').textContent = 'Automated stock source: Alpha Vantage · Provider configuration is managed by an administrator. Yahoo Finance quotes are manual import only.';
+      return;
+    }
     const alpha = state.marketData;
     const status = !alpha ? 'key status unavailable' : alpha.using_demo ? 'demo mode, IBM only' : alpha.has_api_key ? 'API key saved' : 'no API key saved';
     $('#stock-scan-context').textContent = `Automated stock source: Alpha Vantage · ${status}. Yahoo Finance is manual import only.`;
@@ -183,8 +224,8 @@
     $('#last-updated').textContent = data.summary ? `UPDATED ${new Date().toLocaleTimeString(undefined, {hour:'numeric',minute:'2-digit'})}` : 'WAITING FOR DATA';
     renderChart(data.equity_curve); renderAgents(data.agents); renderCandidates(data.candidates); renderPositions(data.positions); renderTrades(data.trades); renderActivity(data.activity);
     const settings = data.settings || {}; const hasAuto = typeof settings.auto_paper === 'boolean';
-    const toggle = $('#auto-toggle'); toggle.disabled = !hasAuto; toggle.setAttribute('aria-checked', String(hasAuto && settings.auto_paper));
-    $('#auto-description').textContent = !hasAuto ? 'Setting unavailable' : settings.auto_paper ? 'Enabled · eligible crypto, manual cycles only' : 'Blocked · manual cycles only';
+    const toggle = $('#auto-toggle'); toggle.disabled = !isAdmin() || !hasAuto; toggle.setAttribute('aria-checked', String(hasAuto && settings.auto_paper));
+    $('#auto-description').textContent = !hasAuto ? 'Setting unavailable' : `${settings.auto_paper ? 'Enabled · eligible crypto, manual cycles only' : 'Blocked · manual cycles only'}${isAdmin() ? '' : ' · Admin controlled'}`;
     renderMarketSelection(settings, !!data.settings); renderWatchlist(settings, !!data.settings);
     if (!preserveSettings) { const form = $('#settings-form'); settingFields.forEach(key => { form.elements[key].value = settings[key] ?? ''; }); form.elements.auto_paper.checked = !!settings.auto_paper; }
   }
@@ -210,7 +251,9 @@
   async function refreshMarketData() { const data = await api('/api/market-data'); renderMarketData(data); return data; }
   async function refreshAfterMutation(fn) { try { await fn(); } catch (e) { throw new Error(`Action completed, but refresh failed. Verify the result before retrying. ${errorText(e)}`); } }
   async function refreshAll(showSuccess = false) {
-    const results = await Promise.allSettled([refreshDashboard(), refreshProviders(), api('/api/health'), refreshMarketData()]);
+    await sessionReady;
+    const results = await Promise.allSettled([refreshDashboard(), isAdmin() ? refreshProviders() : Promise.resolve(), api('/api/health'), isAdmin() ? refreshMarketData() : Promise.resolve()]);
+    if (authLost) return;
     if (results[3].status === 'rejected') { state.marketData = null; $('#market-data-status').textContent = 'Alpha Vantage key status unavailable.'; $('#clear-market-key').disabled = true; renderStockContext(); }
     if (results[0].status === 'rejected') { setConnection(false); notice(`Dashboard unavailable: ${errorText(results[0].reason)}`, true); }
     else if (results[1].status === 'rejected') notice(`Provider settings unavailable: ${errorText(results[1].reason)}`, true);
@@ -221,7 +264,7 @@
   }
   async function runAction(button, task, success) {
     if (button.disabled) return; button.disabled = true;
-    try { const result = await task(); const warnings = warningMessages(result); notice(warnings.length ? `${success} Warnings: ${warnings.join(' · ')}` : success, false, warnings.length > 0); } catch (e) { notice(errorText(e), true); } finally { button.disabled = false; }
+    try { const result = await task(); const warnings = warningMessages(result); notice(warnings.length ? `${success} Warnings: ${warnings.join(' · ')}` : success, false, warnings.length > 0); } catch (e) { notice(errorText(e), true); } finally { button.disabled = button.id === 'auto-toggle' && !isAdmin(); }
   }
   async function runScanAction(action) {
     if (state.scanRunning) return;
@@ -251,7 +294,7 @@
       try { await refreshDashboard(true); } catch (_) { setConnection(false); }
     } finally { state.scanRunning = false; buttons.forEach(button => { button.disabled = false; }); renderMarketSelection(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderWatchlist(state.dashboard?.settings || {}, !!state.dashboard?.settings); }
   }
-  $$('.nav-link').forEach(button => button.addEventListener('click', () => { const page = button.dataset.page; $$('.page').forEach(el => { el.hidden = el.id !== `page-${page}`; }); $$('.nav-link').forEach(el => { const active = el === button; el.classList.toggle('active', active); if (active) el.setAttribute('aria-current','page'); else el.removeAttribute('aria-current'); }); $('#breadcrumb-page').textContent = page.toUpperCase(); window.scrollTo(0,0); }));
+  $$('.nav-link').forEach(button => button.addEventListener('click', () => { const page = button.dataset.page; $$('.page').forEach(el => { el.hidden = el.id !== `page-${page}`; }); $$('.nav-link').forEach(el => { const active = el === button; el.classList.toggle('active', active); if (active) el.setAttribute('aria-current','page'); else el.removeAttribute('aria-current'); }); $('#breadcrumb-page').textContent = page.toUpperCase(); if (page === 'settings' && isAdmin()) loadUsers(); window.scrollTo(0,0); }));
   function updateThemeButton() { const light = document.documentElement.dataset.theme === 'light'; $('#theme-toggle').setAttribute('aria-label', light ? 'Switch to dark mode' : 'Switch to light mode'); }
   updateThemeButton(); $('#theme-toggle').addEventListener('click', () => { const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = theme; try { localStorage.setItem('ledger-six-theme', theme); } catch (_) {} updateThemeButton(); });
   $('#refresh-button').addEventListener('click', async event => { const button = event.currentTarget; button.disabled = true; try { await refreshAll(true); } finally { button.disabled = false; } });
@@ -370,7 +413,165 @@
   $('#test-provider').addEventListener('click', event => { if (!state.providerId) return; runAction(event.currentTarget, async () => { const data = await api(`/api/llm/${encodeURIComponent(state.providerId)}/test`,{method:'POST'}); if (data.success === false || data.ok === false) throw new Error(data.message || data.error || 'Provider connection test failed.'); }, 'Provider connection test completed.'); });
   $('#analyst-form').addEventListener('submit', event => { event.preventDefault(); const form = event.currentTarget, id = state.llm?.active_provider; const context = form.elements.context.value.trim(); if (!id) { notice('Select an active provider before requesting analysis.', true); return; } if (!context) { notice('Enter context for the analyst.', true); return; } runAction($('button[type=submit]',form), async () => { const data = await api(`/api/llm/${encodeURIComponent(id)}/analyze`,json('POST',{context})); if (data.success === false || data.ok === false) throw new Error(data.message || data.error || 'Analysis failed.'); const result = typeof data === 'string' ? data : data.analysis ?? data.response ?? data.result ?? data.content ?? data.message ?? JSON.stringify(data,null,2); $('#analyst-result').textContent = typeof result === 'string' ? result : JSON.stringify(result,null,2); $('#analyst-result').hidden = false; }, 'Analysis complete.'); });
   $('#add-provider-form').addEventListener('submit', event => { event.preventDefault(); const form = event.currentTarget, id = form.elements.provider_id.value.trim(); if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(id)) { notice('Provider ID must use lowercase letters, digits, hyphens, underscores or dots.', true); return; } if (state.llm?.providers?.some(p => p.id === id)) { notice('That provider ID already exists. Select it above to edit it.', true); return; } runAction($('button[type=submit]', form), async () => { await api(`/api/llm/${encodeURIComponent(id)}`, json('PUT',{name:id,kind:'openai',enabled:true})); state.providerId = id; form.reset(); await refreshProviders(); }, 'Provider added. Configure its model and base URL above.'); });
-  restoreScannerDrafts(); renderDashboard({}); renderStockContext(); fillProvider(); restoreScanWarnings(); refreshAll();
+  let usersBusy = false;
+  function userStatus(message, error = false) {
+    const el = $('#users-status'); el.textContent = message; el.classList.toggle('error', error);
+  }
+  function setUsersBusy(busy) {
+    usersBusy = busy;
+    $('#user-admin-controls').disabled = busy;
+    $('#users-refresh').disabled = busy;
+  }
+  function userError(error) {
+    if (error?.status === 403) return 'Administrator access is required to manage users.';
+    if (error?.status === 400 || error?.status === 409 || error?.status === 422) return 'The change was not accepted. Check the username and password requirements; the username may already be in use. You cannot disable, delete, or demote yourself or the last active administrator.';
+    return 'Unable to complete the request. Check your connection and try again.';
+  }
+  function element(tag, className, text) {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text !== undefined) el.textContent = text;
+    return el;
+  }
+  function userButton(text, username, extraClass = '') {
+    const button = element('button', `button button-secondary ${extraClass}`, text);
+    button.type = 'button';
+    button.setAttribute('aria-label', `${text} for ${username}`);
+    return button;
+  }
+  function passwordValid(input) {
+    const length = new TextEncoder().encode(input.value).length;
+    if (length < 12 || length > 128) { userStatus('Passwords must be 12–128 UTF-8 bytes.', true); return false; }
+    return true;
+  }
+  async function fetchUsers() {
+    const result = await api('/api/users');
+    if (!Array.isArray(result.users)) throw new Error('Invalid user list.');
+    renderUsers(result.users);
+  }
+  async function loadUsers() {
+    if (!isAdmin() || isLocalTestMode() || usersBusy || authLost) return;
+    setUsersBusy(true); userStatus('Loading users…');
+    try { await fetchUsers(); userStatus('User list is up to date.'); }
+    catch (e) { if (!authLost) userStatus(userError(e), true); }
+    finally { setUsersBusy(false); }
+  }
+  async function mutateUser(action, message, selfReset = false) {
+    if (!isAdmin() || usersBusy || authLost) return;
+    setUsersBusy(true); userStatus('Saving changes…');
+    try {
+      await action();
+      if (selfReset) { redirectToLogin(); return; }
+      try { await fetchUsers(); userStatus(message); }
+      catch (_) { if (!authLost) userStatus('Change completed, but the user list could not be refreshed. Refresh the list before retrying.', true); }
+    } catch (e) { if (!authLost) userStatus(userError(e), true); }
+    finally { setUsersBusy(false); }
+  }
+  function renderUsers(users) {
+    const list = $('#users-list');
+    list.replaceChildren();
+    if (!users.length) { list.append(element('p', 'users-status', 'No users found.')); return; }
+    const activeAdmins = users.filter(user => user.role === 'admin' && user.enabled === true).length;
+    users.forEach(user => {
+      const username = String(user.username ?? '');
+      const id = encodeURIComponent(String(user.id));
+      const self = username === session.username;
+      const lastAdmin = user.role === 'admin' && user.enabled === true && activeAdmins <= 1;
+      const row = element('article', 'user-row');
+      const identity = element('div', 'user-identity');
+      identity.append(element('strong', 'user-name', username), element('span', 'user-state', `${user.enabled ? 'Enabled' : 'Disabled'} · ${user.role === 'admin' ? 'Admin' : 'User'}${self ? ' · You' : ''}`));
+      row.append(identity);
+
+      const roleForm = element('form', 'user-role-form');
+      const roleLabel = element('label', '', 'Role');
+      const role = element('select'); role.name = 'role'; role.setAttribute('aria-label', `Role for ${username}`);
+      for (const [value, label] of [['user','User'],['admin','Admin']]) { const option = element('option', '', label); option.value = value; role.append(option); }
+      role.value = user.role === 'admin' ? 'admin' : 'user';
+      role.disabled = self || lastAdmin;
+      roleLabel.append(role);
+      const roleSubmit = element('button', 'button button-secondary', 'Save role'); roleSubmit.type = 'submit'; roleSubmit.setAttribute('aria-label', `Save role for ${username}`); roleSubmit.disabled = self || lastAdmin;
+      roleForm.append(roleLabel, roleSubmit);
+      roleForm.addEventListener('submit', event => {
+        event.preventDefault();
+        if (role.disabled || role.value === user.role) return;
+        mutateUser(() => api(`/api/users/${id}`, json('PATCH', {role:role.value})), 'Role updated.');
+      });
+      row.append(roleForm);
+
+      const actions = element('div', 'user-row-actions');
+      const toggle = userButton(user.enabled ? 'Disable' : 'Enable', username);
+      toggle.disabled = user.enabled && (self || lastAdmin);
+      toggle.addEventListener('click', () => {
+        if (user.enabled && !window.confirm(`Disable ${username}? They will no longer be able to sign in.`)) return;
+        mutateUser(() => api(`/api/users/${id}`, json('PATCH', {enabled:!user.enabled})), user.enabled ? 'User disabled.' : 'User enabled.');
+      });
+      const remove = userButton('Delete', username, 'user-danger');
+      remove.disabled = self || lastAdmin;
+      remove.addEventListener('click', () => {
+        if (!window.confirm(`Delete ${username}? This cannot be undone.`)) return;
+        mutateUser(() => api(`/api/users/${id}`, {method:'DELETE'}), 'User deleted.');
+      });
+      actions.append(toggle, remove); row.append(actions);
+
+      const resetForm = element('form', 'reset-password-form');
+      const resetLabel = element('label', '', 'New password');
+      const password = element('input'); password.type = 'password'; password.name = 'password'; password.required = true; password.maxLength = 128; password.autocomplete = 'new-password'; password.setAttribute('aria-label', `New password for ${username}`);
+      resetLabel.append(password);
+      const resetButton = element('button', 'button button-secondary', 'Reset password'); resetButton.type = 'submit'; resetButton.setAttribute('aria-label', `Reset password for ${username}`);
+      resetForm.append(resetLabel, resetButton);
+      resetForm.addEventListener('submit', async event => {
+        event.preventDefault();
+        if (usersBusy || !resetForm.reportValidity() || !passwordValid(password)) return;
+        try { await mutateUser(async () => { await api(`/api/users/${id}/password`, json('POST', {password:password.value})); password.value = ''; }, 'Password reset.', self); }
+        finally { password.value = ''; }
+      });
+      row.append(resetForm);
+      if (self || lastAdmin) row.append(element('div', 'user-lock-note', self ? 'Your own account cannot be disabled, deleted, or demoted. Resetting your password signs you out.' : 'The last active administrator cannot be disabled, deleted, or demoted.'));
+      list.append(row);
+    });
+  }
+  $('#users-refresh').addEventListener('click', loadUsers);
+  $('#create-user-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget, password = form.elements.password;
+    if (usersBusy || !form.reportValidity() || !passwordValid(password)) return;
+    try {
+      await mutateUser(async () => {
+        await api('/api/users', json('POST', {username:form.elements.username.value, password:password.value, role:form.elements.role.value}));
+        form.reset();
+      }, 'User created.');
+    } finally { password.value = ''; }
+  });
+
+  $('#sign-out').addEventListener('click', async event => {
+    const button = event.currentTarget;
+    if (button.disabled) return;
+    button.disabled = true;
+    try { await api('/api/auth/logout', {method:'POST'}); redirectToLogin(); }
+    catch (e) { if (!authLost) { notice('Sign out could not be completed. Check your connection and try again.', true); button.disabled = false; } }
+  });
+  async function start() {
+    try {
+      const current = await sessionReady;
+      if (authLost) return;
+      $('#account-username').textContent = current.username;
+      $('#account-role').textContent = isLocalTestMode() ? 'admin · local test' : current.role;
+      $('#sign-out').hidden = isLocalTestMode();
+      $('#local-auth-message').hidden = !isLocalTestMode();
+      $('#settings-user-message').hidden = isAdmin();
+      $('#admin-settings').hidden = !isAdmin();
+      $('#user-admin-panel').hidden = !isAdmin() || isLocalTestMode();
+      if (!isAdmin()) $('.market-copy p').textContent = 'Scanner and manual cycles use the administrator’s saved market selection and Alpha Vantage watchlist. Only administrators can change these settings or import Yahoo Finance quotes. Auto-paper cycles buy eligible crypto only; stocks are never bought or marked automatically. No background worker runs.';
+      if (isAdmin()) restoreScannerDrafts();
+      renderDashboard({}); renderStockContext(); fillProvider(); restoreScanWarnings();
+      $('#session-loading').hidden = true;
+      $('.app-shell').hidden = false;
+      await refreshAll();
+    } catch (_) {
+      if (!authLost) { $('#session-loading').textContent = 'Unable to verify your session. Check your connection and reload this page.'; }
+    }
+  }
+  start();
   let pollInFlight = false;
-  setInterval(async () => { if (document.hidden || pollInFlight) return; pollInFlight = true; try { await refreshDashboard(true); } catch (e) { setConnection(false); notice(`Dashboard refresh failed: ${errorText(e)}`, true); } finally { pollInFlight = false; } }, 15000);
+  setInterval(async () => { if (!session || authLost || document.hidden || pollInFlight) return; pollInFlight = true; try { await refreshDashboard(true); } catch (e) { if (!authLost) { setConnection(false); notice(`Dashboard refresh failed: ${errorText(e)}`, true); } } finally { pollInFlight = false; } }, 15000);
 })();

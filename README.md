@@ -14,6 +14,14 @@ Phone: [+971 50 832 0336](tel:+971508320336) / [+91 95953 53336](tel:+9195953533
 
 These screenshots were captured from the application in a sandbox. The example balances and stock trades are illustrative simulated data, not a real account or performance record. The scanner screenshot is a time-specific external market-data snapshot; its prices may be stale and it is not an endorsement or safety assessment.
 
+### Sign in
+
+![PaperLedger sign-in screen](docs/screenshots/login.png)
+
+### User administration
+
+![Shared-workspace user administration with an example account](docs/screenshots/user-admin.png)
+
 ### Dashboard and workflow
 
 ![PaperLedger dashboard showing paper portfolio, workflow stages, equity history and scanner](docs/screenshots/dashboard.png)
@@ -50,7 +58,7 @@ The agent-flow panel is an illustrative visual guide, not an indication of activ
 - There is **no continuous trading worker**. The scanner and paper cycle run only when you click their buttons. Enabling automatic paper execution allows a manually triggered cycle to simulate up to three eligible **crypto** buys; stocks are not automatically bought. It does not schedule cycles. The scan-interval field is reserved for a future version. Stop-loss is only a sizing assumption and take-profit is advisory: neither automatically closes positions.
 - Manual buys have no mark until you enter one. Total equity and unrealized P&L are unavailable while any holding is unmarked; older chart points may still appear. Even a recorded mark can be stale. For crypto, symbols are not unique across chains and contracts; this simple ledger groups positions by symbol and asset type, so do not combine distinct tokens that share the same symbol.
 - AI provider responses are advisory and may be wrong. The six stages are programmatic workflow stages; they are not six independent autonomous LLMs. LLM responses cannot place live trades.
-- The server is designed for a **single trusted user on a local computer**, without login or multi-user authorization. The included Compose file binds it to `127.0.0.1` only. Do not expose the port, reverse proxy, or Docker network to untrusted users. Custom provider URLs can access network destinations available to the container, so only configure trusted endpoints. For remote access or multi-user use, authentication, TLS, network restrictions, secret management, and an independent security review are required.
+- The app supports multiple authenticated users in **one shared workspace**. All users can see the same ledger; accounts are not separate portfolios or isolated tenants. It binds to `127.0.0.1` by default. Opt-in network access publishes on every IPv4 interface, which may include public interfaces. The built-in HTTP listener does **not** provide TLS: on a LAN, passwords and app data travel in cleartext. Tailscale encrypts traffic between authenticated tailnet devices, but access still depends on tailnet policy, the host firewall, and app login. Use only trusted networks, verify the effective firewall rules, and never forward the port to the public internet. This project is not an independently audited internet-facing service. Custom provider URLs can reach network destinations available to the container, so configure trusted endpoints only.
 
 ## Requirements
 
@@ -68,7 +76,7 @@ cd paperledger
 bash manage.sh
 ```
 
-Choose **Install / build / start**. The manager offers the configured port, a manually chosen port, or an automatically selected available port, then displays the local URL reported by Docker. Automatic selection requires Python 3 on the machine running the script. Without Python 3, manual and configured ports are unverified until Docker binds them. On Windows, use WSL with Docker Desktop integration or Git Bash with Docker Desktop running. The probe checks the local environment, which can differ from the Docker host; a port can also become occupied between probing and startup. If Docker reports a conflict, choose another port and retry.
+Choose **Install / build / start**. The manager offers the configured port, a manually chosen port, or an automatically selected available port, then displays the local URL reported by Docker. After the container starts, open **User administration** in the manager and create the first administrator. There is no default username or password; until an administrator is created, the app remains locked. Automatic port selection requires Python 3 on the machine running the script. Without Python 3, manual and configured ports are unverified until Docker binds them. On Windows, use WSL with Docker Desktop integration or Git Bash with Docker Desktop running. The probe checks the local environment, which can differ from the Docker host; a port can also become occupied between probing and startup. If Docker reports a conflict, choose another port and retry.
 
 Alternatively, extract `ledger-six-docker.zip`, open the extracted `tradeledger` folder, and run `bash manage.sh`. The archive is not a Git checkout, so clone the repository if you want to use the manager's Git update option.
 
@@ -93,8 +101,9 @@ For a direct non-interactive deployment with the default port:
    docker compose up -d --build
    ```
 
-4. Open **http://127.0.0.1:8080** on the same computer. Change `APP_PORT` in `.env` before starting if 8080 is occupied.
-5. Start in paper mode. Set a starting balance and risk parameters, choose **Stocks**, **Crypto**, or **Both** on the dashboard, and run the scanner. A paper balance is not real money.
+4. Run `bash manage.sh` and use **User administration** to create an administrator. Your chosen password is not stored in plaintext. There are no default credentials.
+5. Open **http://127.0.0.1:8080** on the same computer and log in. Change `APP_PORT` in `.env` before starting if 8080 is occupied.
+6. Start in paper mode. Set a starting balance and risk parameters, choose **Stocks**, **Crypto**, or **Both** on the dashboard, and run the scanner. A paper balance is not real money.
 
 Useful commands:
 
@@ -115,9 +124,26 @@ Run the administrative menu from the project directory:
 bash manage.sh
 ```
 
-On Windows, use WSL with Docker Desktop integration or Git Bash with Docker Desktop running. The menu can install and rebuild, pull from an existing Git checkout, show the current version and health, start/stop/restart the service, view and export logs, choose or find an available local port, back up or restore data, and remove the application. Option **9** changes the port; apply it by choosing install/build/start. Option **14** exports all Compose-project container logs into one private file under `backups/log-exports/` and prints its path. Clean removal preserves data; the separate full-deletion option requires typing `DELETE DATA`. Both preserve `.env` and the `backups/` directory. Exported logs may contain sensitive information; review them before sharing.
+On Windows, use WSL with Docker Desktop integration or Git Bash with Docker Desktop running. The menu can install and rebuild, pull from an existing Git checkout, show the current version and health, start/stop/restart the service, view and export logs, choose or find an available local port, back up or restore data, and remove the application. Option **9** changes the port; apply it by choosing install/build/start. Option **14** exports all Compose-project container logs into one private file under `backups/log-exports/` and prints its path. Option **15** selects network access, and option **16** manages users. Clean removal preserves data; the separate full-deletion option requires typing `DELETE DATA`. Both preserve `.env` and the `backups/` directory. Exported logs may contain sensitive information; review them before sharing.
 
-The menu's backups are stored under `backups/` with restricted permissions where the filesystem supports them. They can contain private ledger data and the generated encryption key. Restore accepts **trusted archives only**, requires typing `RESTORE DATA`, and creates a backup of the existing volume before replacing it. A failed restore keeps the application stopped and reports the pre-restore backup location. The menu does not include `.env` or externally supplied encryption keys in its archive; back them up separately. Do not run concurrent administration or other writers against the volume. Backups use an `alpine:3.20` helper image, which Docker may need to download.
+The menu's backups are stored under `backups/` with restricted permissions where the filesystem supports them. They can contain private ledger data, account password hashes, and the generated encryption key. Restore accepts **trusted archives only**, requires typing `RESTORE DATA`, and creates a backup of the existing volume before replacing it. A failed restore keeps the application stopped and reports the pre-restore backup location. The menu does not include `.env` or externally supplied encryption keys in its archive; back them up separately. Do not run concurrent administration or other writers against the volume. Backups use an `alpine:3.20` helper image, which Docker may need to download.
+
+### Login and user administration
+
+An administrator can create and manage accounts from **Settings → User administration**. In the management script, choose option **16 → 2**, enter a username, choose the `admin` role for the first administrator, and enter and confirm a strong password. The same menu supports password resets and recovery. Passwords must be 12–128 UTF-8 bytes; the app stores salted password hashes, not plaintext passwords. Anyone with access to the host and Docker administration can administer accounts, so protect that access.
+
+Administrators can manage users and change application and provider settings. Standard users can view the shared dashboard and ledger, run scans and paper cycles, and create or mark paper trades; they cannot change global settings, provider credentials, or users. All accounts share the same paper portfolio and activity. Disabling an account or resetting its password invalidates its sessions. The final enabled administrator cannot be removed or disabled.
+
+### Localhost, LAN IP, and Tailscale IP
+
+1. Start the app in its default localhost-only mode and create an administrator using **User administration** (option **16**) in `bash manage.sh`.
+2. In the manager's **Network access** option (**15**), select access on all IPv4 interfaces (**2**). Read the warning and type `ENABLE NETWORK` to confirm, then choose **Install / build / start** to apply it. The named data volume is preserved. The manager does not install Tailscale or change firewall settings.
+3. On the Docker or forwarding host, find its LAN IPv4 address in your operating system's network settings. If Tailscale is installed on that host, `tailscale ip -4` shows its Tailscale IPv4 address. The manager's port display is the source for the port number.
+4. Open `http://127.0.0.1:PORT` on the host, `http://LAN-IP:PORT` from an allowed LAN device, or `http://TAILSCALE-IP:PORT` from an allowed device on the same tailnet. Replace the placeholders with the actual address and port, and sign in. Tailscale access requires Tailscale to be connected and policy to permit traffic on both devices.
+
+`0.0.0.0` is a wildcard bind address, not a browser address. It exposes the port on **all reachable IPv4 interfaces**, not just Tailscale; it may include public-facing interfaces. Restrict access using the effective Docker/host firewall and tailnet policies, do not enable router port forwarding, and verify access from the intended and unintended networks. Docker can bypass conventional Linux UFW rules. On Docker Desktop, Windows/WSL, or a remote daemon, the host's addresses and forwarding behavior can differ from those of the shell running the manager. These addresses and peer connectivity are not automatically verified.
+
+**LAN HTTP is unencrypted:** anyone able to observe the traffic can potentially see passwords, session cookies, ledger data, and settings. Prefer Tailscale between devices, and use LAN HTTP only on a trusted network. Tailscale encrypts the connection between its devices, but does not prevent an authorized peer from using the app. Switching back to localhost-only in the manager requires rebuilding/recreating the service to take effect; account data is retained.
 
 ### Stocks, crypto, or both
 
@@ -150,6 +176,8 @@ Alpha Vantage's default quote is historical/end-of-day, **not a live price**. Ma
 Install and start Ollama on the same host, then download a model using Ollama's instructions. In **Settings → LLM providers**, choose **Ollama local**, specify the model you have installed, and use `http://host.docker.internal:11434/v1` as the base URL. No API key is normally needed for local Ollama. The container must be able to reach Ollama on the host; on Linux, Ollama may need to listen on an interface accessible from Docker rather than only host loopback. Restrict access using your firewall. Select **Test connection** to verify it.
 
 For **Ollama cloud**, configure its cloud model and API key; use the provider's current OpenAI-compatible base URL. Other presets support OpenAI, DeepSeek, Google Gemini, Anthropic, Groq, OpenRouter, xAI, Mistral, and Together AI. Use **Add a provider** to create additional OpenAI-compatible connections, each with its own endpoint, model name, and optional API key. Save the provider before testing; the test uses the saved configuration and sends a small model request, which may incur charges. Only the compatible APIs implemented here are supported; not every provider or model is guaranteed to work. Provider APIs and model availability can change. A successful test requires valid credentials, model access, network reachability, and any provider billing arrangements. Consult the provider's documentation when a test fails.
+
+If a provider has a saved key, changing its provider kind or URL origin requires explicitly replacing or clearing that key. This helps prevent an existing credential from being sent to a different endpoint. Model, display-name, and same-origin URL-path changes can retain the saved key.
 
 ### API keys and data storage
 
@@ -214,13 +242,14 @@ For a local non-Docker test environment:
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt pytest
-DATA_DIR=./data uvicorn app.main:app --host 127.0.0.1 --port 8000
+APP_AUTH_ENABLED=0 APP_BIND_ADDR=127.0.0.1 DATA_DIR=./data uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-proxy-headers
 # In another terminal:
 pytest -q
 bash tests/test_manage.sh
+bash tests/test_deploy.sh
 ```
 
-On Windows, activate with `.venv\Scripts\Activate.ps1` and set `$env:DATA_DIR = './data'`. The Python tests exercise the ledger, scanner and provider adapters; the administration tests use mocked Docker and isolated local Git repositories, not a real Docker daemon. A real Docker build and restore should be verified on the target host before relying on them. If the scanner fails, check your internet connection, service availability and provider rate limits. No scan or AI result is invented if an upstream request fails. If Ollama fails, check its listening address, model name, and accessibility from inside Docker. If saved API keys stop decrypting, restore the original encryption key or clear and re-enter the credentials.
+The command above intentionally disables login **only for localhost development**. Never bind that mode to a network interface. Docker deployments always enable authentication. On Windows, activate with `.venv\Scripts\Activate.ps1` and set `$env:DATA_DIR = './data'`, `$env:APP_AUTH_ENABLED = '0'`, and `$env:APP_BIND_ADDR = '127.0.0.1'` for that development command. The Python tests exercise the ledger, scanner, providers, and authentication; the administration tests use mocked Docker and isolated local Git repositories, not a real Docker daemon. A real Docker build and restore should be verified on the target host before relying on them. If the scanner fails, check your internet connection, service availability and provider rate limits. No scan or AI result is invented if an upstream request fails. If Ollama fails, check its listening address, model name, and accessibility from inside Docker. If saved API keys stop decrypting, restore the original encryption key or clear and re-enter the credentials.
 
 ## References
 

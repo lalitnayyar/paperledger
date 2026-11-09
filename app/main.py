@@ -1,11 +1,10 @@
-"""Local-only paper trading API. This application never places live orders."""
+"""Shared, trusted-user paper trading API. This application never places live orders."""
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -13,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
-from app import db, trading, yahoo_quotes
+from app import auth, db, trading, yahoo_quotes
 from app.llm import router as llm_router
 from app.market_data import router as market_data_router
 
@@ -72,19 +71,17 @@ app = FastAPI(title="TradeLedger Paper Trading", lifespan=lifespan)
 app.add_middleware(StockImportBodyLimitMiddleware)
 app.include_router(llm_router)
 app.include_router(market_data_router)
+app.include_router(auth.router)
 
 
 @app.middleware("http")
 async def local_origin_policy(request: Request, call_next):
-    # No permissive CORS: browser writes must originate from the same host.
-    # This is CSRF defense in depth, not user authentication or a firewall.
-    if request.method not in ("GET", "HEAD", "OPTIONS"):
-        origin = request.headers.get("origin")
-        if origin:
-            parsed = urlsplit(origin)
-            if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != request.headers.get("host", "").lower() or parsed.path not in ("", "/"):
-                return JSONResponse(status_code=403, content={"detail": "Cross-origin requests are not allowed."})
-    if request.url.path.startswith("/api/"):
+    # Authentication and origin checks run in the outer ASGI guard.
+    # Health and the separate authentication store do not depend on ledger init.
+    path = request.url.path
+    if (path.startswith("/api/") and path != "/api/health"
+            and not path.startswith("/api/auth/") and path != "/api/users"
+            and not path.startswith("/api/users/")):
         try:
             # Also supports ASGI test clients that do not enter lifespan.
             db.ensure_initialized()
@@ -325,3 +322,7 @@ def index():
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR), check_dir=False), name="static")
+
+# Added last so this guard is the outermost application middleware: unauthorized
+# requests cannot reach database initialization, body parsing, or endpoint code.
+app.add_middleware(auth.AuthGuardMiddleware)

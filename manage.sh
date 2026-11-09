@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Interactive administration for the Ledger Six Docker Compose application.
 # Bash 3.2+; Docker Engine and Docker Compose v2 are required for Docker actions.
+# Never trace password-handling commands, even if the invoking shell enabled tracing.
+set +x
+set +a
+# Remove any inherited export attributes before these names are used locally.
+unset secret_pw secret_again
 set -u
 set -o pipefail
 set -f
@@ -35,12 +40,18 @@ version() {
     fi
 }
 compose() {
-    # Compose normally prioritizes shell variables over .env. APP_PORT changes in
-    # the protected .env must be effective for commands run by this script.
+    # Compose normally prioritizes shell variables over .env. Persisted port,
+    # bind and auth settings must win; retain APP_ENCRYPTION_KEY behavior. Reject
+    # symlinks rather than reading configuration from an unintended location.
+    if [ -L "$ROOT/.env" ]; then
+        say_error 'Refusing to use a symlinked .env. Replace it with a regular protected file.'
+        return 1
+    fi
     if [ -f "$ROOT/.env" ]; then
-        ( unset APP_PORT; docker compose --env-file "$ROOT/.env" --project-directory "$ROOT" -f "$ROOT/compose.yaml" "$@" )
+        ( unset APP_PORT APP_BIND_ADDR APP_AUTH_ENABLED APP_AUTH_USER APP_AUTH_HASH COMPOSE_ENV_FILES COMPOSE_DISABLE_ENV_FILE; docker compose --env-file "$ROOT/.env" --project-directory "$ROOT" -f "$ROOT/compose.yaml" "$@" )
     else
-        ( unset APP_PORT COMPOSE_ENV_FILES COMPOSE_DISABLE_ENV_FILE; docker compose --project-directory "$ROOT" -f "$ROOT/compose.yaml" "$@" )
+        if [ -e "$ROOT/.env" ]; then say_error '.env exists but is not a regular file.'; return 1; fi
+        ( unset APP_PORT APP_BIND_ADDR APP_AUTH_ENABLED APP_AUTH_USER APP_AUTH_HASH COMPOSE_ENV_FILES COMPOSE_DISABLE_ENV_FILE; docker compose --project-directory "$ROOT" -f "$ROOT/compose.yaml" "$@" )
     fi
 }
 docker_helper() {
@@ -69,6 +80,10 @@ check_docker() {
 }
 create_env_if_missing() {
     if [ -e "$ROOT/.env" ] || [ -L "$ROOT/.env" ]; then
+        if [ -L "$ROOT/.env" ]; then
+            say_error 'Refusing to use a symlinked .env. Replace it with a regular protected file.'
+            return 1
+        fi
         if [ ! -f "$ROOT/.env" ]; then
             say_error '.env exists but is not a regular file.'
             return 1
@@ -284,7 +299,7 @@ archive_volume() {
 }
 backup_notes() {
     printf '%s\n' \
-        'Archives are sensitive: they contain private ledger data and may contain the generated encryption key.' \
+        'Archives are sensitive: they contain private ledger data, user accounts and password hashes, and may contain the generated encryption key.' \
         'Back up .env and any separately supplied APP_ENCRYPTION_KEY securely and separately; keep the original key for restores.' \
         'Protect archives and keys; do not upload them to public repositories.' \
         'Do not run simultaneous deployments or other volume writers during backup, restore, or deletion.'
@@ -319,7 +334,7 @@ do_backup() {
 do_restore() {
     check_docker || return 1
     printf '%s\n' 'Restore ONLY a trusted tar.gz archive: tar readability does not make an archive safe.' \
-        'Restoring replaces ALL contents of the named ledger-six-data volume; .env is not restored.' \
+        'Restoring replaces ALL contents of the named ledger-six-data volume, including user accounts and password hashes; .env is not restored.' \
         'The original separately stored encryption key and .env must be backed up/restored separately.'
     printf 'Archive path (absolute, or relative to this project; blank cancels): '
     local archive confirm initial_volume_state result=0
@@ -451,6 +466,8 @@ normalize_port() {
     VALID_PORT=$p
 }
 # Return 0 for successful bind, 2 for a bind failure, 3 for unavailable probe.
+# Probe all IPv4 interfaces in every mode: conservatively detect conflicts that
+# would prevent a future wildcard binding, even in localhost-only mode.
 # Port 0 asks the kernel for an ephemeral port. Closing the socket does not
 # reserve it for Docker; it is necessarily a point-in-time check.
 probe_port() {
@@ -461,7 +478,7 @@ import socket
 import sys
 try:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", int(sys.argv[1])))
+        sock.bind(("0.0.0.0", int(sys.argv[1])))
         print(sock.getsockname()[1])
 except OSError:
     sys.exit(2)
@@ -475,12 +492,13 @@ PY
 }
 # A Compose mapping alone cannot prove which process occupies the local port,
 # particularly with remote daemons, WSL, or Docker Desktop. Require both a
-# running project container and its exact loopback mapping before offering reuse.
+# running project container and its exact loopback or wildcard IPv4 mapping
+# before offering reuse. Multiline, IPv6 and other mappings are not accepted.
 own_service_maps_port() {
     local wanted=$1 endpoint ids id running
     command -v docker >/dev/null 2>&1 || return 1
     endpoint=$(compose port "$SERVICE" 8000 2>/dev/null) || return 1
-    [ "$endpoint" = "127.0.0.1:$wanted" ] || return 1
+    case "$endpoint" in "127.0.0.1:$wanted"|"0.0.0.0:$wanted") ;; *) return 1 ;; esac
     ids=$(compose ps --all --quiet "$SERVICE" 2>/dev/null) || return 1
     for id in $ids; do
         case "$id" in ''|*[!0-9a-f]*) return 1 ;; esac
@@ -492,7 +510,7 @@ own_service_maps_port() {
 check_selected_port() {
     local port=$1 rc answer
     if probe_port "$port"; then
-        printf 'Port %s was bindable on this machine at the time of the check; it is not reserved.\n' "$port"
+        printf 'Port %s was bindable on all IPv4 interfaces on this machine at the time of the check; it is not reserved.\n' "$port"
         return 0
     else
         rc=$?
@@ -502,7 +520,7 @@ check_selected_port() {
         return 0
     fi
     if own_service_maps_port "$port"; then
-        printf '%s\n' 'The local bind failed, but this project reports a running service publishing this exact loopback port.' \
+        printf '%s\n' 'The conservative all-IPv4 bind failed, but this project reports a running service publishing this exact loopback or wildcard port.' \
             'This does not prove the local conflict belongs to that service, especially with WSL, Docker Desktop, or a remote Docker host.'
         printf 'Type REUSE to try this existing service mapping, or anything else to cancel: '
         IFS= read -r answer || return 1
@@ -510,7 +528,7 @@ check_selected_port() {
         printf '%s\n' 'Reusing the reported service port; Docker will verify it at startup. No unrelated process will be stopped.'
         return 0
     fi
-    say_error "Cannot bind 127.0.0.1:$port (it may be in use or access may be denied). Choose another port or use automatic selection."
+    say_error "Cannot bind 0.0.0.0:$port (it may be in use on any IPv4 interface or access may be denied). This conservative check can reject a usable localhost-only port. Choose another port or use automatic selection."
     return 1
 }
 choose_port() {
@@ -522,7 +540,8 @@ choose_port() {
     else
         printf '%s\n' 'Configured APP_PORT is not a simple valid numeric port, or .env cannot be safely read. Choose a manual or automatic port, or repair .env.'
     fi
-    printf '%s\n' '1) Keep configured port  2) Enter a port manually  3) Choose an available local port automatically  0) Cancel'
+    printf '%s\n' '1) Keep configured port  2) Enter a port manually  3) Choose an available local port automatically  0) Cancel' \
+        'Port probes conservatively bind all IPv4 interfaces even for localhost-only mode.'
     printf 'Port choice [1]: '
     IFS= read -r choice || return 1
     case "$choice" in
@@ -560,18 +579,31 @@ choose_port() {
     printf '%s\n' 'A probe is not a reservation: another process can take the port before Docker starts.' \
         'The probe runs on this machine, not necessarily the Docker daemon host; WSL and Docker Desktop may use different networking/host forwarding.'
 }
-show_published_url() {
+# Accept exactly one loopback or wildcard IPv4 endpoint and a numeric valid port.
+# Never construct URLs from arbitrary Docker output or guess among multiple mappings.
+published_endpoint() {
     local endpoint port
-    endpoint=$(compose port "$SERVICE" 8000 2>/dev/null) || endpoint=
+    endpoint=$(compose port "$SERVICE" 8000 2>/dev/null) || return 1
     case "$endpoint" in
-        127.0.0.1:*) port=${endpoint#127.0.0.1:} ;;
-        *) printf '%s\n' 'Could not confirm a single localhost published port from Docker; check Status.'; return 1 ;;
+        127.0.0.1:*) PUBLISHED_BIND=127.0.0.1; port=${endpoint#127.0.0.1:} ;;
+        0.0.0.0:*) PUBLISHED_BIND=0.0.0.0; port=${endpoint#0.0.0.0:} ;;
+        *) return 1 ;;
     esac
-    if ! normalize_port "$port"; then
-        printf '%s\n' 'Docker did not report a valid localhost port; check Status.'
+    normalize_port "$port" || return 1
+    PUBLISHED_PORT=$VALID_PORT
+}
+show_published_url() {
+    if ! published_endpoint; then
+        printf '%s\n' 'Could not confirm a single loopback or wildcard IPv4 published port from Docker; check Status.'
         return 1
     fi
-    printf 'Published URL: http://127.0.0.1:%s\n' "$VALID_PORT"
+    printf 'Published URL: http://127.0.0.1:%s\n' "$PUBLISHED_PORT"
+    if [ "$PUBLISHED_BIND" = 0.0.0.0 ]; then
+        printf 'Unverified LAN template: http://<LAN-IP>:%s\n' "$PUBLISHED_PORT"
+        printf 'Unverified Tailscale template: http://<TAILSCALE-IP>:%s\n' "$PUBLISHED_PORT"
+        printf '%s\n' 'Replace the placeholders with the Docker host/forwarding host addresses; on the host, tailscale ip -4 may show its Tailscale IPv4 address.' \
+            'These are templates, not connectivity checks. LAN HTTP has no TLS: passwords and ledger data travel in cleartext.'
+    fi
     printf '%s\n' 'This is localhost on the Docker/forwarding host; WSL, Docker Desktop, and remote Docker may have different host access.'
 }
 do_deploy() {
@@ -584,7 +616,7 @@ do_deploy() {
     fi
     compose ps --all "$SERVICE" || return 1
     show_published_url || :
-    printf '%s\n' 'Service is configured to bind to 127.0.0.1 only. Use Status to check its local health.'
+    printf '%s\n' 'Use Status to check local health. With no users the app is locked; use option 16 to create the first administrator.'
 }
 do_update() {
     local before after head_before head_after
@@ -628,20 +660,17 @@ do_update() {
 do_status() {
     check_docker || return 1
     compose ps --all "$SERVICE" || return 1
-    local endpoint port
+    local port
     if ! command -v curl >/dev/null 2>&1; then
         printf '%s\n' 'curl is not installed; local HTTP health check skipped.'
         return 0
     fi
-    if ! endpoint=$(compose port "$SERVICE" 8000 2>/dev/null); then endpoint=; fi
-    # Only probe loopback, never an arbitrary endpoint returned by Docker.
-    endpoint=${endpoint%%$'\n'*}
-    port=${endpoint##*:}
-    case "$port" in ''|*[!0-9]*) printf '%s\n' 'No published local port found; local HTTP health check skipped.'; return 0 ;; esac
-    if [ "${#port}" -gt 5 ] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        printf '%s\n' 'Invalid published port; local HTTP health check skipped.'
+    # Only probe loopback after a single recognized Docker endpoint is confirmed.
+    if ! published_endpoint; then
+        printf '%s\n' 'No single valid loopback or wildcard IPv4 published port found; local HTTP health check skipped.'
         return 0
     fi
+    port=$PUBLISHED_PORT
     if curl --noproxy '*' --fail --silent --show-error --max-time 5 -o /dev/null "http://127.0.0.1:$port/api/health"; then
         printf 'Local health OK: http://127.0.0.1:%s/api/health\n' "$port"
     else
@@ -650,14 +679,24 @@ do_status() {
     fi
 }
 write_port() {
-    local port=$1 temp
+    write_env_setting APP_PORT "$1"
+}
+write_env_setting() {
+    local key=$1 value=$2 temp
+    # Values are hard-coded by callers or previously validated; never evaluate .env.
+    case "$key:$value" in
+        APP_PORT:*) normalize_port "$value" || return 1; value=$VALID_PORT ;;
+        APP_BIND_ADDR:127.0.0.1|APP_BIND_ADDR:0.0.0.0) ;;
+        *) say_error 'Invalid environment setting.'; return 1 ;;
+    esac
     if [ -L "$ROOT/.env" ]; then say_error 'Refusing to replace a symlinked .env. Edit it securely by hand.'; return 1; fi
+    if [ ! -f "$ROOT/.env" ]; then say_error '.env is not a regular file; no setting was changed.'; return 1; fi
     if ! temp=$(mktemp "$ROOT/.env.manage-XXXXXX"); then say_error 'Could not create a protected temporary .env.'; return 1; fi
     TEMP_ENV=$temp
     if ! chmod 600 "$temp"; then rm -f "$temp"; TEMP_ENV=; say_error 'Could not protect temporary .env.'; return 1; fi
     # Preserve every other line, including lines within single-quoted multiline
-    # Compose values. Refuse a multiline APP_PORT instead of corrupting it.
-    if ! awk -v new="$port" '
+    # Compose values. Refuse a multiline target instead of corrupting it.
+    if ! awk -v key="$key" -v new="$value" '
         BEGIN { q=sprintf("%c",39); multi=0; found=0; bad=0 }
         function closes(s, start,    i,c,esc) {
             esc=0
@@ -671,33 +710,161 @@ write_port() {
         }
         {
             if (multi) { print; if (closes($0,1)) multi=0; next }
-            if ($0 ~ /^[[:space:]]*(export[[:space:]]+)?APP_PORT[[:space:]]*(#.*)?$/) {
+            if ($0 ~ ("^[[:space:]]*(export[[:space:]]+)?" key "[[:space:]]*(#.*)?$")) {
                 cr=($0 ~ /\r$/ ? "\r" : "")
-                print "APP_PORT=" new cr; found=1; next
+                print key "=" new cr; found=1; next
             }
             if (match($0,/^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[:=][[:space:]]*/)) {
                 prefix=substr($0,1,RLENGTH); value=substr($0,RLENGTH+1)
                 quoted=(substr(value,1,1)==q)
-                isport=(prefix ~ /^[[:space:]]*(export[[:space:]]+)?APP_PORT[[:space:]]*[:=]/)
-                if (isport) {
+                istarget=(prefix ~ ("^[[:space:]]*(export[[:space:]]+)?" key "[[:space:]]*[:=]"))
+                if (istarget) {
                     if (quoted && !closes(value,2)) { bad=1; exit 2 }
                     cr=($0 ~ /\r$/ ? "\r" : "")
-                    print "APP_PORT=" new cr; found=1; next
+                    print key "=" new cr; found=1; next
                 }
                 if (quoted && !closes(value,2)) multi=1
             }
             print
         }
-        END { if (multi) exit 2; if (!bad && !found) print "APP_PORT=" new }
+        END { if (multi) exit 2; if (!bad && !found) print key "=" new }
     ' "$ROOT/.env" > "$temp"; then
         rm -f "$temp"
         TEMP_ENV=
-        say_error 'Could not safely update .env (a multiline APP_PORT is not supported); original file was preserved.'
+        say_error "Could not safely update .env (a multiline $key or an unclosed value is not supported); original file was preserved."
+        return 1
+    fi
+    if [ -L "$ROOT/.env" ] || [ ! -f "$ROOT/.env" ]; then
+        rm -f "$temp"; TEMP_ENV=
+        say_error '.env changed or became a symlink; no setting was replaced.'
         return 1
     fi
     if ! mv -f "$temp" "$ROOT/.env"; then rm -f "$temp"; TEMP_ENV=; say_error 'Could not replace .env; original file was preserved.'; return 1; fi
     TEMP_ENV=
-    printf 'APP_PORT set to %s in protected .env. All other entries were retained.\n' "$port"
+    printf '%s set to %s in protected .env. All other entries were retained.\n' "$key" "$value"
+}
+choose_network() {
+    local choice confirm
+    printf '%s\n' \
+        'Network access: 1) Localhost only (127.0.0.1, the default)  2) All IPv4 interfaces (0.0.0.0)  0) Cancel' \
+        'When APP_BIND_ADDR is absent, the safe Compose default is 127.0.0.1.'
+    printf 'Network choice [0]: '
+    IFS= read -r choice || return 1
+    case "$choice" in
+        ''|0) printf '%s\n' 'Network selection cancelled; .env was not changed.'; return 0 ;;
+        1)
+            create_env_if_missing || return 1
+            write_env_setting APP_BIND_ADDR 127.0.0.1 || return 1
+            ;;
+        2)
+            printf '%s\n' \
+                'WARNING: All IPv4 interfaces may include public interfaces, not just LAN and Tailscale.' \
+                'Verify the effective host AND Docker firewall protections; do NOT port-forward this service.' \
+                'LAN HTTP has NO TLS: passwords and ledger data travel in cleartext. Prefer a Tailscale tunnel and use only trusted private networks.' \
+                'Localhost, LAN IP and Tailscale IP may work simultaneously where networking permits; connectivity is not guaranteed.'
+            printf 'Type ENABLE NETWORK to opt in, or anything else to cancel: '
+            IFS= read -r confirm || return 1
+            if [ "$confirm" != 'ENABLE NETWORK' ]; then printf '%s\n' 'Network selection cancelled; .env was not changed.'; return 0; fi
+            # exec requires a running service; a nonzero result includes stopped,
+            # unavailable and no-active-admin cases. Never inspect or modify the DB.
+            check_docker || return 1
+            if ! compose exec -T "$SERVICE" python -m app.user_cli admin-exists </dev/null >/dev/null 2>&1; then
+                say_error 'Cannot confirm an active administrator in the running service. Start the default localhost service with option 1, then create an administrator with option 16 before enabling network access.'
+                return 1
+            fi
+            create_env_if_missing || return 1
+            write_env_setting APP_BIND_ADDR 0.0.0.0 || return 1
+            ;;
+        *) say_error 'Invalid network choice; .env was not changed.'; return 1 ;;
+    esac
+    printf '%s\n' \
+        'Network setting saved but NOT automatically applied. Use option 1 or run docker compose up -d --build from the project directory to apply it.' \
+        'Switching to localhost leaves authentication and all accounts intact. External Compose invocations may allow shell variables to override .env.'
+}
+
+read_username() {
+    local LC_ALL=C
+    printf 'Username (3-32 ASCII letters, digits, dot, underscore or hyphen; blank cancels): '
+    IFS= read -r USER_NAME || return 1
+    if [ -z "$USER_NAME" ]; then printf '%s\n' 'User action cancelled.'; return 1; fi
+    case "$USER_NAME" in *[!A-Za-z0-9._-]*) say_error 'Invalid username; use only ASCII letters, digits, dot, underscore or hyphen.'; return 1 ;; esac
+    if [ "${#USER_NAME}" -lt 3 ] || [ "${#USER_NAME}" -gt 32 ]; then
+        say_error 'Username must be 3-32 ASCII characters.'; return 1
+    fi
+}
+read_user_role() {
+    printf 'Role (admin/user): '
+    IFS= read -r USER_ROLE || return 1
+    case "$USER_ROLE" in admin|user) ;; *) say_error 'Role must be exactly admin or user.'; return 1 ;; esac
+}
+user_cli() {
+    # No passwords are passed through this argument-only path.
+    compose exec -T "$SERVICE" python -m app.user_cli "$@" </dev/null
+}
+user_password_action() {
+    local LC_ALL=C secret_pw='' secret_again='' result=1
+    # Even an inherited exported variable with these names must not export secrets.
+    export -n secret_pw secret_again
+    printf 'Password (12-128 bytes, hidden): '
+    if ! IFS= read -rs secret_pw; then printf '\n'; unset secret_pw secret_again; return 1; fi
+    printf '\nConfirm password (hidden): '
+    if ! IFS= read -rs secret_again; then printf '\n'; unset secret_pw secret_again; return 1; fi
+    printf '\n'
+    if [ "$secret_pw" != "$secret_again" ]; then
+        say_error 'Passwords did not match; no account was changed.'
+    elif [ "${#secret_pw}" -lt 12 ] || [ "${#secret_pw}" -gt 128 ]; then
+        say_error 'Password must be 12-128 bytes; no account was changed.'
+    elif printf '%s\n' "$secret_pw" | compose exec -T "$SERVICE" python -m app.user_cli "$@" >/dev/null 2>&1; then
+        printf '%s\n' 'User account operation completed.'
+        result=0
+    else
+        # Suppress backend output for secret-bearing commands to avoid accidentally
+        # echoing a secret. The CLI also performs its own authoritative checks.
+        say_error 'User account operation failed. Check that the service is running and that username, role and password satisfy the backend rules.'
+    fi
+    unset secret_pw secret_again
+    return "$result"
+}
+user_administration() {
+    local selection confirm
+    check_docker || return 1
+    printf '%s\n' \
+        'The ledger is shared. Admins have full access; users may view, scan, cycle and trade but cannot edit settings or users.' \
+        'Docker CLI access on this host is administrator power: anyone with it can manage accounts and access data. Restrict it to trusted administrators.' \
+        'Start the service first. If no users exist, the application is locked; create the first administrator here.'
+    while :; do
+        printf '\n%s\n' 'User administration: 1) List  2) Create  3) Reset password  4) Change role' \
+            '5) Enable  6) Disable  7) Delete  0) Return'
+        printf 'User choice: '
+        IFS= read -r selection || return 0
+        case "$selection" in
+            1) user_cli list || say_error 'Could not list accounts; ensure the service is running.' ;;
+            2)
+                if read_username && read_user_role; then
+                    user_password_action create "$USER_NAME" "$USER_ROLE" || :
+                fi ;;
+            3)
+                if read_username; then user_password_action password "$USER_NAME" || :; fi ;;
+            4)
+                if read_username && read_user_role; then
+                    user_cli role "$USER_NAME" "$USER_ROLE" || say_error 'Could not change the role; the backend protects the last active administrator.'
+                fi ;;
+            5)
+                if read_username; then user_cli enable "$USER_NAME" || say_error 'Could not enable the account.'; fi ;;
+            6)
+                if read_username; then user_cli disable "$USER_NAME" || say_error 'Could not disable the account; the backend protects the last active administrator.'; fi ;;
+            7)
+                if read_username; then
+                    printf 'Type DELETE USER %s to confirm deletion, or anything else to cancel: ' "$USER_NAME"
+                    IFS= read -r confirm || return 0
+                    if [ "$confirm" = "DELETE USER $USER_NAME" ]; then
+                        user_cli delete "$USER_NAME" || say_error 'Could not delete the account; the backend protects the last active administrator.'
+                    else printf '%s\n' 'User deletion cancelled.'; fi
+                fi ;;
+            0|q|Q) return 0 ;;
+            *) printf '%s\n' 'Invalid user choice.' ;;
+        esac
+    done
 }
 do_export_logs() {
     local ids id stamp dir file failed=0 count=0
@@ -751,7 +918,7 @@ do_delete() {
     check_docker || return 1
     printf '%s\n' \
         "DANGER: This removes this Compose project's containers, the ledger-six:local image tag, and the entire ledger-six-data volume." \
-        'Ledger data and any generated in-volume encryption key will be permanently lost. .env and backups are preserved.' \
+        'Ledger data, user accounts, and any generated in-volume encryption key will be permanently lost. .env and backups are preserved.' \
         'The image tag and named volume are global: make sure NO other project depends on them, including projects not currently running.'
     backup_notes
     printf 'Type DELETE DATA to confirm permanent deletion, or anything else to cancel: '
@@ -800,6 +967,7 @@ show_menu() {
 9) Choose APP_PORT              10) Back up data volume
 11) Restore trusted backup      12) Clean removal (preserve data)
 13) Full deletion (DANGER)      14) Export all container logs to one private file
+15) Network access selection    16) User administration
 0) Exit / back
 MENU
 }
@@ -813,6 +981,9 @@ The named data volume and image tag are global and must not be shared with other
 projects. Do not run concurrent administration or volume writers. Backups
 require the alpine:3.20 image, pulled by Docker if absent. Port checks are local
 and temporary; Docker is authoritative and may run on a different host.
+The default network binding is localhost only. Network exposure requires an
+active administrator and explicit confirmation; LAN HTTP is not encrypted.
+Docker CLI access is administrator power and should be restricted.
 EOF
 }
 case "${1-}" in
@@ -821,8 +992,9 @@ case "${1-}" in
     *) usage >&2; exit 2 ;;
 esac
 if [ "$#" -gt 0 ]; then say_error 'Unexpected arguments.'; exit 2; fi
-printf '%s\n' 'Local-only deployment: the included Compose file binds 127.0.0.1.' \
-    'Do not share the fixed image tag or named data volume with other projects.'
+printf '%s\n' 'The default bind address is localhost (127.0.0.1); network exposure is an explicit opt-in.' \
+    'Authentication is always enabled; when there are no users, start the app and create the first administrator with option 16.' \
+    'Docker CLI access is administrator power. Do not share the fixed image tag or named data volume with other projects.'
 backup_notes
 while :; do
     show_menu
@@ -844,14 +1016,16 @@ while :; do
         7) if check_docker; then printf '%s\n' 'Logs may contain sensitive information.'; compose logs --tail 200 "$SERVICE" || say_error 'Could not read logs.'; fi ;;
         8) if check_docker; then printf '%s\n' 'Logs may contain sensitive information. Press Ctrl-C to return or exit.'; compose logs --follow --tail 200 "$SERVICE" || :; fi ;;
         9) if choose_port; then
-               printf '%s\n' 'To apply a changed port, choose install/build/start; existing data is preserved. The included Compose file binds 127.0.0.1 only.' \
-                   'This script ignores a shell-exported APP_PORT for Compose; external Compose invocations may override .env.'
+               printf '%s\n' 'To apply a changed port, choose install/build/start; existing data is preserved.' \
+                   'This script ignores shell-exported APP_PORT, APP_BIND_ADDR and APP_AUTH_ENABLED for Compose; external Compose invocations may override .env.'
            fi ;;
         10) do_backup || : ;;
         11) do_restore || : ;;
         12) do_clean || : ;;
         13) do_delete || : ;;
         14) do_export_logs || : ;;
+        15) choose_network || : ;;
+        16) user_administration || : ;;
         0|q|Q) printf '%s\n' 'Exiting; no additional changes made.'; break ;;
         *) printf '%s\n' 'Invalid choice.' ;;
     esac

@@ -6,7 +6,7 @@ set -euo pipefail
 SOURCE=$(CDPATH='' cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/ledger-manage-tests.XXXXXX")
 PORT_HOLDERS=
-trap 'for pid in $PORT_HOLDERS; do kill "$pid" 2>/dev/null || :; done; rm -rf "$TMP"' EXIT
+trap 'for pid in $PORT_HOLDERS; do kill "$pid" 2>/dev/null || :; done; for pid in $PORT_HOLDERS; do wait "$pid" 2>/dev/null || :; done; rm -rf "$TMP"' EXIT
 ORIG_PATH=$PATH
 SOURCE_VERSION=$(cat "$SOURCE/VERSION")
 COUNT=0
@@ -40,6 +40,13 @@ case "$cmd" in
  compose)
     if [ "${1-}" = version ]; then exit 0; fi
     [ -z "${APP_PORT+x}" ] || touch "$s/shell_port_leaked"
+    [ -z "${APP_BIND_ADDR+x}" ] || touch "$s/shell_bind_leaked"
+    [ -z "${APP_AUTH_ENABLED+x}" ] || touch "$s/shell_auth_leaked"
+    [ -z "${APP_AUTH_USER+x}" ] || touch "$s/shell_auth_user_leaked"
+    [ -z "${APP_AUTH_HASH+x}" ] || touch "$s/shell_auth_hash_leaked"
+    [ -z "${COMPOSE_ENV_FILES+x}" ] || touch "$s/compose_env_files_leaked"
+    [ -z "${COMPOSE_DISABLE_ENV_FILE+x}" ] || touch "$s/compose_disable_env_file_leaked"
+    [ "${APP_ENCRYPTION_KEY-}" != keep-encryption ] || touch "$s/encryption_retained"
     env_file=
     while [ "$#" -gt 0 ]; do
         case "$1" in --env-file) env_file=$2; shift 2 ;; --project-directory|-f) shift 2 ;; *) break ;; esac
@@ -59,6 +66,26 @@ case "$cmd" in
             touch "$s/container" "$s/running" "$s/volume" "$s/image" ;;
         port) [ ! -f "$s/fail_port" ] || exit 1
               if [ -f "$s/reported_port" ]; then cat "$s/reported_port"; else printf '127.0.0.1:%s\n' "$(cat "$s/port")"; fi ;;
+        exec)
+            [ "${1-}" = -T ] && [ "${2-}" = ledger ] && [ "${3-}" = python ] && [ "${4-}" = -m ] && [ "${5-}" = app.user_cli ] || exit 2
+            shift 5
+            [ -f "$s/running" ] || exit 1
+            case "${1-}" in
+                admin-exists) [ -f "$s/active_admin" ] || exit 1 ;;
+                list) printf '%s\n' 'alice admin active' ;;
+                create|password)
+                    [ -z "${secret_pw+x}" ] || touch "$s/secret_exported"
+                    [ -z "${secret_again+x}" ] || touch "$s/secret_exported"
+                    IFS= read -r supplied || exit 1
+                    LC_ALL=C
+                    printf '%s\n' "${#supplied}" > "$s/password_bytes"
+                    if [ "$supplied" = "$(printf 'Correct-%s-%s!' Horse Battery)" ]; then touch "$s/password_exact"; fi
+                    [ ! -f "$s/echo_password" ] || { printf '%s\n' "$supplied"; printf '%s\n' "$supplied" >&2; }
+                    unset supplied
+                    touch "$s/password_received" ;;
+                role|enable|disable|delete) [ ! -f "$s/fail_user_action" ] || { printf '%s\n' 'last active administrator protected' >&2; exit 1; } ;;
+                *) exit 2 ;;
+            esac ;;
         down) rm -f "$s/container" "$s/running" ;;
         start) touch "$s/running" ;;
         stop) rm -f "$s/running" ;;
@@ -315,7 +342,7 @@ PY
     HELD=$(cat "$STATE/held-port")
 }
 free_port() {
-    python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
+    python3 -c 'import socket; s=socket.socket(); s.bind(("0.0.0.0",0)); print(s.getsockname()[1]); s.close()'
 }
 
 fixture
@@ -337,15 +364,15 @@ fixture
 hold_port
 printf 'APP_PORT=%s\nSECRET_KEY=secret-never-show\n' "$HELD" > "$APP/.env"
 cp "$APP/.env" "$CASE/before"
-printf '8080\n' > "$STATE/port"
-run_menu '1\n1\n0\n'
-contains "$CASE/out" 'Cannot bind 127.0.0.1:'
-not_contains "$STATE/log" $'up\t-d'
+    printf '8080\n' > "$STATE/port"
+    run_menu '1\n1\n0\n'
+    contains "$CASE/out" 'Cannot bind 0.0.0.0:'
+    not_contains "$STATE/log" $'up\t-d'
 cmp -s "$APP/.env" "$CASE/before" || fail 'occupied configured port changed .env'
-not_contains "$CASE/out" 'secret-never-show'
-run_menu "9\n2\n$HELD\n0\n"
-contains "$CASE/out" 'Cannot bind 127.0.0.1:'
-cmp -s "$APP/.env" "$CASE/before" || fail 'occupied manual port changed .env'
+    not_contains "$CASE/out" 'secret-never-show'
+    run_menu "9\n2\n$HELD\n0\n"
+    contains "$CASE/out" 'Cannot bind 0.0.0.0:'
+    cmp -s "$APP/.env" "$CASE/before" || fail 'occupied manual port changed .env'
 not_contains "$STATE/log" $'stop\t'
 
 fixture
@@ -359,11 +386,11 @@ run_menu '1\n1\nREUSE\n0\n'
 contains "$CASE/out" 'Reusing the reported service port'
 contains "$STATE/log" $'up\t-d\t--build\tledger'
 not_contains "$STATE/log" $'stop\t'
-rm -f "$STATE/running"
-: > "$STATE/log"
-run_menu '1\n1\n0\n'
-contains "$CASE/out" 'Cannot bind 127.0.0.1:'
-not_contains "$STATE/log" $'up\t-d'
+    rm -f "$STATE/running"
+    : > "$STATE/log"
+    run_menu '1\n1\n0\n'
+    contains "$CASE/out" 'Cannot bind 0.0.0.0:'
+    not_contains "$STATE/log" $'up\t-d'
 
 fixture
 hold_port
@@ -432,8 +459,11 @@ contains "$CASE/out" 'Published URL: http://127.0.0.1:54321'
 not_contains "$CASE/out" "Published URL: http://127.0.0.1:$p"
 printf '0.0.0.0:54321\n' > "$STATE/reported_port"
 run_menu '4\n0\n'
-contains "$CASE/out" 'Could not confirm a single localhost published port'
-not_contains "$CASE/out" 'Published URL:'
+contains "$CASE/out" 'Published URL: http://127.0.0.1:54321'
+contains "$CASE/out" 'Unverified LAN template: http://<LAN-IP>:54321'
+contains "$CASE/out" 'Unverified Tailscale template: http://<TAILSCALE-IP>:54321'
+contains "$CASE/out" 'tailscale ip -4'
+not_contains "$CASE/out" 'http://0.0.0.0:'
 
 fixture
 touch "$STATE/second"
@@ -502,5 +532,280 @@ git -C "$APP" -c user.name=Test -c user.email=test@example.invalid commit -qm in
 run_menu '2\n0\n'
 contains "$CASE/out" 'no configured Git upstream'
 not_contains "$STATE/log" $'up\t-d'
+
+# Cancellation never creates or modifies .env, and exposure requires a precise
+# opt-in before even attempting the admin check.
+fixture
+run_menu '15\n0\n15\n2\nENABLE\n0\n'
+[ ! -e "$APP/.env" ] || fail 'cancelled network choice created .env'
+not_contains "$STATE/log" $'admin-exists\t'
+contains "$CASE/out" 'NO TLS'
+contains "$CASE/out" 'do NOT port-forward'
+contains "$CASE/out" 'host AND Docker firewall'
+contains "$CASE/out" 'Tailscale tunnel'
+
+fixture
+cat > "$APP/.env" <<'ENV'
+# retained comment
+APP_PORT=8123
+SENSITIVE=do-not-display-this
+OTHER='line one
+APP_BIND_ADDR=inside-multiline
+line three'
+export APP_BIND_ADDR = '127.0.0.1'
+APP_BIND_ADDR: 127.0.0.1
+APP_BIND_ADDR
+ENV
+cp "$APP/.env" "$CASE/before"
+run_menu '15\n2\nENABLE NETWORK\n0\n'
+cmp -s "$CASE/before" "$APP/.env" || fail 'no-admin refusal changed .env'
+contains "$CASE/out" 'Cannot confirm an active administrator'
+contains "$STATE/log" $'exec\t-T\tledger\tpython\t-m\tapp.user_cli\tadmin-exists\t'
+not_contains "$STATE/log" $'up\t-d'
+touch "$STATE/active_admin"
+rm -f "$STATE/running"
+run_menu '15\n2\nENABLE NETWORK\n0\n'
+cmp -s "$CASE/before" "$APP/.env" || fail 'stopped-service refusal changed .env'
+touch "$STATE/running"
+run_menu '15\n2\nENABLE NETWORK\n0\n'
+cat > "$CASE/expected" <<'ENV'
+# retained comment
+APP_PORT=8123
+SENSITIVE=do-not-display-this
+OTHER='line one
+APP_BIND_ADDR=inside-multiline
+line three'
+APP_BIND_ADDR=0.0.0.0
+APP_BIND_ADDR=0.0.0.0
+APP_BIND_ADDR=0.0.0.0
+ENV
+cmp -s "$CASE/expected" "$APP/.env" || fail 'network writer did not preserve other lines or replace duplicate settings'
+is_private_file "$APP/.env" || fail 'network .env not mode 600'
+not_contains "$CASE/out" 'do-not-display-this'
+contains "$CASE/out" 'NOT automatically applied'
+contains "$CASE/out" 'docker compose up -d --build'
+not_contains "$STATE/log" $'up\t-d'
+run_menu '15\n1\n0\n'
+contains "$APP/.env" 'APP_BIND_ADDR=127.0.0.1'
+contains "$APP/.env" 'APP_BIND_ADDR=inside-multiline'
+contains "$CASE/out" 'authentication and all accounts intact'
+not_contains "$STATE/log" $'delete\t'
+
+fixture
+printf 'APP_PORT=8123\nSENSITIVE=secret\n' > "$APP/.env"
+cp "$APP/.env" "$CASE/before"
+run_menu '15\n0\n0\n'
+cmp -s "$CASE/before" "$APP/.env" || fail 'cancelled existing env changed'
+contains "$CASE/out" 'safe Compose default is 127.0.0.1'
+run_menu '15\n1\n0\n'
+contains "$APP/.env" 'APP_BIND_ADDR=127.0.0.1'
+contains "$APP/.env" 'SENSITIVE=secret'
+is_private_file "$APP/.env" || fail 'legacy .env not protected'
+
+fixture
+touch "$STATE/active_admin"
+run_menu '15\n2\nENABLE NETWORK\n0\n'
+contains "$APP/.env" 'APP_BIND_ADDR=0.0.0.0'
+contains "$APP/.env" 'APP_PORT=8080'
+is_private_file "$APP/.env" || fail 'new network .env not protected'
+not_contains "$STATE/log" $'up\t-d'
+
+fixture
+printf 'APP_BIND_ADDR=127.0.0.1\nSECRET=target\n' > "$CASE/real-env"
+chmod 644 "$CASE/real-env"
+ln -s "$CASE/real-env" "$APP/.env"
+cp "$CASE/real-env" "$CASE/before"
+run_menu '15\n1\n0\n'
+[ -L "$APP/.env" ] && cmp -s "$CASE/before" "$CASE/real-env" || fail 'symlinked .env or target was altered'
+[ "$(LC_ALL=C ls -ld "$CASE/real-env" | cut -c1-10)" = '-rw-r--r--' ] || fail 'symlink target permissions were altered'
+contains "$CASE/out" 'symlinked .env'
+run_menu '16\n1\n0\n0\n'
+not_contains "$STATE/log" $'app.user_cli\tlist\t'
+
+fixture
+printf "APP_BIND_ADDR='127.0.0.1\ncontinued'\nOTHER=preserved\n" > "$APP/.env"
+cp "$APP/.env" "$CASE/before"
+run_menu '15\n1\n0\n'
+cmp -s "$CASE/before" "$APP/.env" || fail 'multiline target was altered'
+contains "$CASE/out" 'Could not safely update .env'
+printf "OTHER='unclosed\nAPP_BIND_ADDR=not-a-setting\n" > "$APP/.env"
+cp "$APP/.env" "$CASE/before"
+run_menu '15\n1\n0\n'
+cmp -s "$CASE/before" "$APP/.env" || fail 'unclosed other multiline setting was altered'
+contains "$CASE/out" 'Could not safely update .env'
+
+# Ignore inherited settings both with and without an environment file, while
+# leaving the externally supplied encryption key available to Compose.
+fixture
+export APP_PORT=34567 APP_BIND_ADDR=0.0.0.0 APP_AUTH_ENABLED=0 APP_AUTH_USER=legacy APP_AUTH_HASH=legacy COMPOSE_ENV_FILES=invalid COMPOSE_DISABLE_ENV_FILE=1 APP_ENCRYPTION_KEY=keep-encryption
+run_menu '16\n1\n0\n0\n'
+printf 'APP_PORT=8080\nAPP_BIND_ADDR=127.0.0.1\n' > "$APP/.env"
+run_menu '16\n1\n0\n0\n'
+unset APP_PORT APP_BIND_ADDR APP_AUTH_ENABLED APP_AUTH_USER APP_AUTH_HASH COMPOSE_ENV_FILES COMPOSE_DISABLE_ENV_FILE APP_ENCRYPTION_KEY
+for flag in shell_port_leaked shell_bind_leaked shell_auth_leaked shell_auth_user_leaked shell_auth_hash_leaked compose_env_files_leaked compose_disable_env_file_leaked; do
+    [ ! -f "$STATE/$flag" ] || fail "inherited $flag reached Compose"
+done
+[ -f "$STATE/encryption_retained" ] || fail 'encryption key was not retained for Compose'
+
+# Every operation forwards only validated arguments; credentials go to stdin,
+# and even simulated backend echoes are not displayed or written to files.
+fixture
+touch "$STATE/echo_password"
+secret='Correct-Horse-Battery!'
+export secret_pw=previously-exported secret_again=previously-exported
+run_menu "16\n1\n2\nalice\nadmin\n$secret\n$secret\n3\nalice\n$secret\n$secret\n4\nalice\nuser\n5\nalice\n6\nalice\n7\nalice\nNO\n7\nalice\nDELETE USER alice\n0\n0\n"
+unset secret_pw secret_again
+contains "$STATE/log" $'exec\t-T\tledger\tpython\t-m\tapp.user_cli\tlist\t'
+contains "$STATE/log" $'app.user_cli\tcreate\talice\tadmin\t'
+contains "$STATE/log" $'app.user_cli\tpassword\talice\t'
+contains "$STATE/log" $'app.user_cli\trole\talice\tuser\t'
+contains "$STATE/log" $'app.user_cli\tenable\talice\t'
+contains "$STATE/log" $'app.user_cli\tdisable\talice\t'
+[ "$(grep -Fc $'app.user_cli\tdelete\talice\t' "$STATE/log")" = 1 ] || fail 'delete confirmation did not gate the action'
+[ -f "$STATE/password_received" ] && [ -f "$STATE/password_exact" ] && [ ! -f "$STATE/secret_exported" ] || fail 'password was changed, not piped, or exported'
+not_contains "$CASE/out" "$secret"
+not_contains "$STATE/log" "$secret"
+if grep -R -F -q -- "$secret" "$CASE"; then fail 'password appeared in a case file'; fi
+contains "$CASE/out" 'The ledger is shared'
+contains "$CASE/out" 'administrator power'
+
+fixture
+secret='Correct-Horse-Battery!'
+printf '%b' "16\n3\nalice\n$secret\n$secret\n0\n0\n" | bash -x "$APP/manage.sh" > "$CASE/out" 2>&1
+[ -f "$STATE/password_exact" ] || fail 'traced manager did not forward the password'
+if grep -R -F -q -- "$secret" "$CASE"; then fail 'tracing exposed the password in a case file'; fi
+
+fixture
+long_password=$(printf '%0129d' 0)
+boundary_password=$(printf '%0128d' 0)
+run_menu "16\n2\nab\n2\nbad/name\n2\nalice\nADMIN\n3\nalice\nshort\nshort\n3\nalice\n123456789012\nnot-matching\n3\nalice\n$long_password\n$long_password\n3\nalice\n$boundary_password\n$boundary_password\n0\n0\n"
+not_contains "$STATE/log" $'app.user_cli\tcreate\t'
+[ "$(grep -Fc $'app.user_cli\tpassword\talice\t' "$STATE/log")" = 1 ] || fail 'bad passwords were forwarded or 128-byte password rejected'
+[ "$(cat "$STATE/password_bytes")" = 128 ] || fail '128-byte password did not reach CLI intact'
+contains "$CASE/out" '3-32 ASCII'
+contains "$CASE/out" 'Role must be exactly admin or user'
+contains "$CASE/out" 'Passwords did not match'
+contains "$CASE/out" 'Password must be 12-128 bytes'
+
+fixture
+# Six two-byte characters are accepted by byte count, not character count.
+run_menu '16\n3\nalice\néééééé\néééééé\n0\n0\n'
+[ "$(cat "$STATE/password_bytes")" = 12 ] || fail 'UTF-8 password was not counted as bytes'
+contains "$STATE/log" $'app.user_cli\tpassword\talice\t'
+
+fixture
+name32=abcdefghijklmnopqrstuvwxyz012345
+name33=${name32}6
+run_menu "16\n5\n$name32\n5\n$name33\n5\nÉabc\n5\n-opt\n0\n0\n"
+contains "$STATE/log" $'app.user_cli\tenable\tabcdefghijklmnopqrstuvwxyz012345\t'
+contains "$STATE/log" $'app.user_cli\tenable\t-opt\t'
+[ "$(grep -Fc $'app.user_cli\tenable\t' "$STATE/log")" = 2 ] || fail 'invalid usernames reached CLI'
+
+# Drive a real pseudo-terminal so the read -s behavior is tested, including
+# spaces and literal backslashes. No password or transcript is written to disk.
+fixture
+python3 - "$APP/manage.sh" <<'PY' || fail 'interactive terminal password echo test failed'
+import os, pty, select, subprocess, sys, time
+master, slave = pty.openpty()
+p = subprocess.Popen(['bash', sys.argv[1]], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+secret = b'No echo \\ password!'
+buf = b''
+transcript = b''
+def expect(text):
+    global buf, transcript
+    deadline = time.monotonic() + 10
+    while text not in buf:
+        if time.monotonic() > deadline: raise RuntimeError('terminal prompt timed out: ' + repr(text))
+        ready, _, _ = select.select([master], [], [], 0.2)
+        if ready:
+            chunk = os.read(master, 65536)
+            if not chunk: raise RuntimeError('terminal closed')
+            buf += chunk
+            transcript += chunk
+    buf = buf.split(text, 1)[1]
+def send(text): os.write(master, text + b'\n')
+try:
+    expect(b'Choose an option: '); send(b'16')
+    expect(b'User choice: '); send(b'2')
+    expect(b'blank cancels): '); send(b'alice')
+    expect(b'Role (admin/user): '); send(b'admin')
+    expect(b'Password (12-128 bytes, hidden): '); send(secret)
+    expect(b'Confirm password (hidden): '); send(secret)
+    expect(b'User choice: '); send(b'0')
+    expect(b'Choose an option: '); send(b'0')
+    expect(b'Exiting; no additional changes made.')
+    if secret in transcript: raise RuntimeError('password was echoed to terminal')
+    if p.wait(timeout=10) != 0: raise RuntimeError('manager exited unsuccessfully')
+finally:
+    if p.poll() is None: p.kill(); p.wait()
+    os.close(master)
+PY
+[ -f "$STATE/password_received" ] || fail 'terminal password did not reach CLI'
+
+fixture
+touch "$STATE/fail_user_action"
+run_menu '16\n4\nalice\nuser\n6\nalice\n7\nalice\nDELETE USER alice\n0\n0\n'
+contains "$CASE/out" 'last active administrator'
+
+fixture
+hold_port
+printf 'APP_PORT=%s\nAPP_BIND_ADDR=0.0.0.0\n' "$HELD" > "$APP/.env"
+printf '0.0.0.0:%s\n' "$HELD" > "$STATE/reported_port"
+run_menu '1\n1\nNO\n0\n'
+not_contains "$STATE/log" $'up\t-d'
+run_menu '1\n1\nREUSE\n0\n'
+contains "$CASE/out" 'Reusing the reported service port'
+contains "$STATE/log" $'up\t-d\t--build\tledger'
+contains "$CASE/out" 'Unverified Tailscale template:'
+
+fixture
+python3 - "$STATE/held-port" <<'PY' &
+import socket, sys, time
+s = socket.socket()
+s.bind(('127.0.0.2', 0))
+s.listen()
+with open(sys.argv[1], 'w') as f: f.write(str(s.getsockname()[1]))
+time.sleep(300)
+PY
+PORT_HOLDERS="$PORT_HOLDERS $!"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ ! -s "$STATE/held-port" ] || break
+    sleep 0.1
+done
+[ -s "$STATE/held-port" ] || fail 'secondary-interface socket holder failed'
+HELD=$(cat "$STATE/held-port")
+printf 'APP_PORT=%s\nAPP_BIND_ADDR=0.0.0.0\n' "$HELD" > "$APP/.env"
+run_menu '1\n1\n0\n'
+contains "$CASE/out" 'Cannot bind 0.0.0.0:'
+not_contains "$STATE/log" $'up\t-d'
+
+fixture
+for mapping in '192.168.1.3:8080' '0.0.0.0:65536' '[::]:8080' '0.0.0.0:8080 junk'; do
+    printf '%s\n' "$mapping" > "$STATE/reported_port"
+    run_menu '4\n0\n'
+    contains "$CASE/out" 'Could not confirm a single loopback or wildcard IPv4 published port'
+    not_contains "$CASE/out" 'Published URL:'
+done
+printf '0.0.0.0:8080\n127.0.0.1:8080\n' > "$STATE/reported_port"
+run_menu '4\n0\n'
+not_contains "$CASE/out" 'Published URL:'
+contains "$CASE/out" 'Could not confirm a single loopback or wildcard IPv4 published port'
+
+fixture
+cat > "$CASE/bin/curl" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$TEST_STATE/curl-args"
+MOCK
+chmod +x "$CASE/bin/curl"
+printf '0.0.0.0:45678\n' > "$STATE/reported_port"
+run_menu '3\n0\n'
+contains "$STATE/curl-args" 'http://127.0.0.1:45678/api/health'
+contains "$CASE/out" 'Local health OK'
+rm "$STATE/curl-args"
+printf '0.0.0.0:45678\n127.0.0.1:45678\n' > "$STATE/reported_port"
+run_menu '3\n0\n'
+[ ! -f "$STATE/curl-args" ] || fail 'health check accepted multiple mappings'
+contains "$CASE/out" 'local HTTP health check skipped'
 
 printf 'PASS: %s isolated cases, including real local Git and mocked Docker.\n' "$COUNT"

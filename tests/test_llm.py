@@ -241,3 +241,210 @@ def test_bad_request_never_reflects_key(client):
     assert client.put("/api/llm/openai", json={"api_key": secret, "clear_key": True}).status_code == 422
     assert client.post("/api/llm/openai/analyze", json={"context": ""}).status_code == 422
     assert client.post("/api/llm/missing/test").status_code == 404
+
+
+def stored_provider(tmp_path, provider_id):
+    with sqlite3.connect(tmp_path / "providers.sqlite3") as conn:
+        conn.row_factory = sqlite3.Row
+        return dict(conn.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone())
+
+
+@pytest.mark.parametrize(("provider_id", "new_url", "kind"), [
+    ("openai", "HTTPS://API.OPENAI.COM:443/another/path", "openai-compatible"),
+    ("google", "HTTPS://GENERATIVELANGUAGE.GOOGLEAPIS.COM:443/another", "gemini"),
+    ("ollama-cloud", "HTTPS://OLLAMA.COM:443/another", "ollama"),
+    ("ollama-local", "HTTP://HOST.DOCKER.INTERNAL:11434/another", "ollama-local"),
+    ("anthropic", "HTTPS://API.ANTHROPIC.COM:443/another", "anthropic"),
+])
+def test_same_origin_and_alias_keep_saved_key(client, tmp_path, provider_id, new_url, kind):
+    key = "saved-key-same-origin"
+    assert client.put(f"/api/llm/{provider_id}", json={"api_key": key}).status_code == 200
+    before = stored_provider(tmp_path, provider_id)
+    response = client.put(f"/api/llm/{provider_id}", json={
+        "base_url": new_url, "kind": kind, "name": "New name", "model": "new-model",
+        "api_key": "", "clear_key": False,
+    })
+    assert response.status_code == 200
+    assert response.json()["has_key"] is True
+    assert response.json()["base_url"] == new_url
+    assert response.json()["name"] == "New name"
+    assert response.json()["model"] == "new-model"
+    assert key not in response.text
+    after = stored_provider(tmp_path, provider_id)
+    assert after["encrypted_key"] == before["encrypted_key"]
+    assert llm._load_provider(provider_id)[1] == key
+
+
+@pytest.mark.parametrize("provider_id", ["openai", "google", "ollama-local", "ollama-cloud", "anthropic"])
+@pytest.mark.parametrize("change", ["origin", "kind"])
+@pytest.mark.parametrize(("key_present", "key_value"), [(False, None), (True, None), (True, ""), (True, "  ")])
+def test_hijack_update_rejected_atomically_without_sending_key(client, tmp_path, monkeypatch, provider_id, change, key_present, key_value):
+    key = "stored-secret-never-expose"
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "OK"}}],
+            "candidates": [{"content": {"parts": [{"text": "OK"}]}}],
+            "content": [{"type": "text", "text": "OK"}],
+        })
+
+    install_provider_transport(monkeypatch, handler)
+    assert client.put(f"/api/llm/{provider_id}", json={"api_key": key, "model": "test-model"}).status_code == 200
+    assert client.put("/api/llm/active/select", json={"id": provider_id}).status_code == 200
+    before = stored_provider(tmp_path, provider_id)
+    changes = {"name": "Attempted name", "model": "attempted-model", "enabled": False, "clear_key": False}
+    if key_present:
+        changes["api_key"] = key_value
+    if change == "origin":
+        changes["base_url"] = "https://attacker.example/v1"
+    else:
+        changes["kind"] = "openai" if before["kind"] != "openai" else "google"
+    response = client.put(f"/api/llm/{provider_id}", json=changes)
+    assert response.status_code == 409
+    assert "replacing or clearing" in response.json()["detail"]
+    assert key not in response.text
+    assert calls == []
+    assert stored_provider(tmp_path, provider_id) == before
+    assert client.get("/api/llm").json()["active_provider"] == provider_id
+
+    # Even a subsequent test can only send the original key to the original host.
+    result = client.post(f"/api/llm/{provider_id}/test")
+    assert result.status_code == 200 and result.json()["ok"] is True
+    assert key not in result.text
+    assert len(calls) == 1
+    assert calls[0].url.host == httpx.URL(before["base_url"]).host
+    header = {"openai": "authorization", "google": "x-goog-api-key", "anthropic": "x-api-key"}[before["kind"]]
+    assert key in calls[0].headers[header]
+
+
+@pytest.mark.parametrize(("old_url", "new_url"), [
+    ("https://example.com/v1", "https://other.example/v1"),
+    ("https://example.com/v1", "https://example.com:444/v1"),
+    ("https://example.com/v1", "https://example.com:0/v1"),
+    ("http://localhost:11434/v1", "https://localhost:11434/v1"),
+    ("https://example.com/v1", "https://example.com./v1"),
+    ("https://faß.de/v1", "https://fass.de/v1"),
+    ("https://example.com/v1", ""),
+    ("", "https://example.com/v1"),
+])
+def test_origin_changes_including_empty_are_rejected(client, tmp_path, monkeypatch, old_url, new_url):
+    calls = []
+    install_provider_transport(monkeypatch, lambda request: calls.append(request))
+    key = "secret-for-origin-comparison"
+    assert client.put("/api/llm/origin-test", json={"base_url": old_url, "model": "model", "api_key": key}).status_code == 200
+    before = stored_provider(tmp_path, "origin-test")
+    response = client.put("/api/llm/origin-test", json={"base_url": new_url, "api_key": None})
+    assert response.status_code == 409
+    assert key not in response.text
+    assert stored_provider(tmp_path, "origin-test") == before
+    assert calls == []
+
+
+@pytest.mark.parametrize(("old_url", "new_url"), [
+    ("http://localhost/v1", "HTTP://LOCALHOST:80/new"),
+    ("https://example.com/v1", "HTTPS://EXAMPLE.COM:0443/new"),
+    ("https://faß.de/v1", "https://xn--fa-hia.de/new"),
+    ("http://[::1]:11434/v1", "http://[0:0:0:0:0:0:0:1]:11434/new"),
+])
+def test_equivalent_origins_allow_path_updates(client, tmp_path, old_url, new_url):
+    assert client.put("/api/llm/equivalent", json={"base_url": old_url, "api_key": "saved-secret"}).status_code == 200
+    before = stored_provider(tmp_path, "equivalent")
+    response = client.put("/api/llm/equivalent", json={"base_url": new_url})
+    assert response.status_code == 200
+    assert stored_provider(tmp_path, "equivalent")["encrypted_key"] == before["encrypted_key"]
+
+
+def test_origin_normalization_never_resolves_dns(monkeypatch):
+    def unexpected_dns(*args, **kwargs):
+        pytest.fail("Origin comparison must not make DNS requests")
+
+    monkeypatch.setattr(llm.socket, "getaddrinfo", unexpected_dns)
+    assert llm._url_origin("HTTPS://FAß.DE:443/path") == ("https", "xn--fa-hia.de", 443)
+    assert llm._url_origin("http://EXAMPLE.COM:0/path") == ("http", "example.com", 0)
+
+
+@pytest.mark.parametrize("bad_url", [
+    "https://example.com:bad/v1", "https:///v1", "https://user:pass@example.com/v1",
+    "https://example.com../v1", "https://example.com:99999/v1", "https://[v1.abc]/v1",
+])
+def test_malformed_saved_origin_fails_closed(client, tmp_path, bad_url):
+    key = "malformed-origin-secret"
+    assert client.put("/api/llm/openai", json={"api_key": key}).status_code == 200
+    with sqlite3.connect(tmp_path / "providers.sqlite3") as conn:
+        conn.execute("UPDATE providers SET base_url=? WHERE id='openai'", (bad_url,))
+    before = stored_provider(tmp_path, "openai")
+    response = client.put("/api/llm/openai", json={"name": "must not be saved"})
+    assert response.status_code == 409
+    assert key not in response.text
+    assert stored_provider(tmp_path, "openai") == before
+    # An explicit clear lets the user repair a bad legacy record safely.
+    repaired = client.put("/api/llm/openai", json={"base_url": "https://api.openai.com/v1", "clear_key": True})
+    assert repaired.status_code == 200 and repaired.json()["has_key"] is False
+
+
+@pytest.mark.parametrize("bad_url", ["https://example.com../v1", "https://[v1.abc]/v1"])
+@pytest.mark.parametrize("key_change", [{}, {"api_key": "new-secret"}, {"clear_key": True}])
+def test_malformed_new_origin_fails_closed(client, tmp_path, bad_url, key_change):
+    assert client.put("/api/llm/openai", json={"api_key": "protected-secret"}).status_code == 200
+    before = stored_provider(tmp_path, "openai")
+    response = client.put("/api/llm/openai", json={"base_url": bad_url, **key_change})
+    assert response.status_code == 422
+    assert "protected-secret" not in response.text
+    assert "new-secret" not in response.text
+    assert stored_provider(tmp_path, "openai") == before
+
+
+@pytest.mark.parametrize("provider_id", ["openai", "google", "ollama-local", "ollama-cloud", "anthropic"])
+@pytest.mark.parametrize("action", ["replace", "clear"])
+def test_explicit_key_replacement_or_clear_allows_origin_and_kind_change(client, tmp_path, monkeypatch, provider_id, action):
+    calls = []
+    old_key, new_key = "old-provider-secret", "replacement-provider-secret"
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "OK"}}],
+            "content": [{"type": "text", "text": "OK"}],
+        })
+
+    install_provider_transport(monkeypatch, handler)
+    assert client.put(f"/api/llm/{provider_id}", json={"api_key": old_key, "model": "test-model"}).status_code == 200
+    original = stored_provider(tmp_path, provider_id)
+    new_kind = "anthropic" if original["kind"] == "openai" else "openai"
+    changes = {"base_url": "https://new.example/v2", "kind": new_kind}
+    changes.update({"api_key": new_key} if action == "replace" else {"clear_key": True})
+    response = client.put(f"/api/llm/{provider_id}", json=changes)
+    assert response.status_code == 200
+    assert old_key not in response.text and new_key not in response.text
+    assert response.json()["base_url"] == "https://new.example/v2"
+    assert response.json()["kind"] == new_kind
+    assert response.json()["has_key"] == (action == "replace")
+    saved = stored_provider(tmp_path, provider_id)
+    assert saved["encrypted_key"] != original["encrypted_key"]
+    assert llm._load_provider(provider_id)[1] == (new_key if action == "replace" else None)
+
+    result = client.post(f"/api/llm/{provider_id}/test")
+    assert old_key not in result.text and new_key not in result.text
+    if action == "clear" and new_kind == "anthropic":
+        assert not result.json()["ok"] and calls == []
+    else:
+        assert result.json()["ok"] and len(calls) == 1
+        assert calls[0].url.host == "new.example"
+        assert all(old_key not in value for value in calls[0].headers.values())
+        if action == "replace":
+            header = "x-api-key" if new_kind == "anthropic" else "authorization"
+            assert new_key in calls[0].headers[header]
+        else:
+            assert "authorization" not in calls[0].headers
+
+
+def test_unkeyed_and_unconfigured_provider_backwards_compatibility(client, tmp_path):
+    assert client.put("/api/llm/custom", json={"base_url": "https://first.example", "kind": "google"}).status_code == 200
+    assert client.put("/api/llm/custom", json={"base_url": "https://second.example", "kind": "openai"}).status_code == 200
+    assert client.put("/api/llm/unconfigured", json={"api_key": "preconfigured-key"}).status_code == 200
+    before = stored_provider(tmp_path, "unconfigured")
+    response = client.put("/api/llm/unconfigured", json={"name": "Local name", "model": "local-model", "api_key": None})
+    assert response.status_code == 200 and response.json()["has_key"] is True
+    assert stored_provider(tmp_path, "unconfigured")["encrypted_key"] == before["encrypted_key"]

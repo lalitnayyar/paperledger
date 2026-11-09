@@ -6,10 +6,12 @@ services:
     restart: unless-stopped
     init: true
     ports:
-      - "127.0.0.1:${APP_PORT:-8080}:8000"
+      - "${APP_BIND_ADDR:-127.0.0.1}:${APP_PORT:-8080}:8000"
     environment:
       DATA_DIR: /data
       APP_PORT: ${APP_PORT:-8080}
+      APP_BIND_ADDR: ${APP_BIND_ADDR:-127.0.0.1}
+      APP_AUTH_ENABLED: "1"
       # Optional: supply a Fernet key from your environment, rather than storing
       # the automatically generated key beside the database. See README.
       APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}

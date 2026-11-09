@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Sign in — Ledger / Six</title>
+  <link rel="stylesheet" href="/static/login.css">
+  <script src="/static/login.js" defer></script>
+</head>
+<body>
+  <main class="login-layout">
+    <div class="login-brand"><div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div><div><div class="brand-name">LEDGER <span>/</span> SIX</div><div class="brand-sub">PAPER TRADING WORKSPACE</div></div></div>
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="eyebrow"><span></span> YOUR TRADING DESK <i>/ ACCOUNT ACCESS</i></div>
+      <h1 id="login-title">Clarity starts here<span>.</span></h1>
+      <p class="intro">Sign in to your shared paper trading workspace.</p>
+      <form id="login-form">
+        <label for="username">Username</label>
+        <input id="username" name="username" autocomplete="username" required autofocus>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <p id="login-error" class="login-error" role="alert" hidden></p>
+        <button id="login-submit" type="submit">Sign in <span aria-hidden="true">→</span></button>
+      </form>
+      <p class="transport-note">LAN HTTP is not encrypted. Prefer Tailscale for remote access.</p>
+      <div class="setup-note"><div class="setup-icon" aria-hidden="true">01</div><div><strong>Setting up for the first time?</strong><p>Run <code>bash manage.sh</code>, open <b>User administration</b>, and create the initial admin. Passwords are never displayed after creation.</p></div></div>
+    </section>
+    <div class="login-footer"><span>LEDGER / SIX</span><span>PAPER ENVIRONMENT · SIMULATED TRADES ONLY</span></div>
+  </main>
+</body>
+</html>
