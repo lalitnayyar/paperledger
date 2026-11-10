@@ -2,7 +2,9 @@
   'use strict';
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
-  const state = { dashboard: null, llm: null, providerId: '', marketData: null, marketDirty: false, marketSaving: false, watchlistDirty: false, watchlistSaving: false, importSaving: false, scanRunning: false, scanWarnings: [] };
+  const state = { dashboard: null, llm: null, providerId: '', marketData: null, marketDirty: false, marketSaving: false, watchlistDirty: false, watchlistSaving: false, importSaving: false, scanRunning: false, scanWarnings: [], holdingsFilter: 'all' };
+  const markDrafts = new Map();
+  const markPending = new Set();
   let session = null;
   let authLost = false;
   function redirectToLogin() {
@@ -126,9 +128,31 @@
     }).join('');
   }
   function renderPositions(items) {
-    if (document.activeElement && document.activeElement.matches('.mark-form input')) return;
-    items = Array.isArray(items) ? items : []; $('#positions-empty').hidden = items.length > 0;
-    $('#positions-body').innerHTML = items.map(item => `<tr><td><strong>${escapeHtml(item.symbol || '—')}</strong><small>${escapeHtml(item.asset_type || '')}</small></td><td>${number(item.quantity)}</td><td>${price(item.entry_price)}</td><td>${price(item.mark_price)}<small>${escapeHtml(item.mark_source || 'Unmarked')}${item.mark_timestamp ? ` · ${escapeHtml(date(item.mark_timestamp))}` : ''}</small></td><td class="${present(item.unrealized_pnl) && Number(item.unrealized_pnl) > 0 ? 'positive' : present(item.unrealized_pnl) && Number(item.unrealized_pnl) < 0 ? 'negative' : ''}">${money(item.unrealized_pnl)}</td><td><form class="mark-form" data-id="${escapeHtml(item.id)}"><input type="number" min="0.000000000000000001" step="any" name="price" required aria-label="New mark price for ${escapeHtml(item.symbol || 'position')}" placeholder="Price"><button class="button button-secondary" type="submit">Update</button></form></td></tr>`).join('');
+    const available = Array.isArray(items);
+    // The dashboard positions are the source of truth, not scanner candidates or watchlists.
+    const owned = available ? items.filter(item => item && present(item.quantity) && Number(item.quantity) > 0) : [];
+    const counts = {all:owned.length, stock:owned.filter(item => item.asset_type === 'stock').length, crypto:owned.filter(item => item.asset_type === 'crypto').length};
+    const filtered = state.holdingsFilter === 'all' ? owned : owned.filter(item => item.asset_type === state.holdingsFilter);
+    $$('[data-holdings-filter]').forEach(button => {
+      const key = button.dataset.holdingsFilter;
+      button.setAttribute('aria-pressed', String(key === state.holdingsFilter));
+      $(`#holdings-count-${key}`).textContent = available ? String(counts[key]) : '—';
+    });
+    $('#holdings-count').textContent = available ? `Showing ${filtered.length} of ${owned.length} open holding${owned.length === 1 ? '' : 's'}.` : 'Holdings unavailable; refresh to try again.';
+    $('#positions-empty').hidden = available && filtered.length > 0;
+    $('#positions-empty-title').textContent = !available ? 'Holdings unavailable' : state.holdingsFilter === 'all' ? 'No open holdings' : `No ${state.holdingsFilter === 'stock' ? 'stock' : 'crypto'} holdings`;
+    $('#positions-empty-help').textContent = !available ? 'Refresh to load your paper positions.' : 'Use Add stock or Add crypto to prepare a paper BUY. Scanner results and watchlists do not create holdings.';
+    const activeMark = document.activeElement?.matches('.mark-form input') ? document.activeElement.closest('.mark-form').dataset.id : null;
+    $('#positions-body').innerHTML = filtered.map(item => {
+      const type = item.asset_type === 'stock' ? 'Stock' : item.asset_type === 'crypto' ? 'Crypto' : String(item.asset_type || 'Unknown type');
+      const symbol = escapeHtml(item.symbol || '—'), id = String(item.id);
+      const sell = ['stock', 'crypto'].includes(item.asset_type) && item.symbol ? `<button class="button button-secondary sell-holding" type="button" data-sell-position="${escapeHtml(id)}" aria-label="Prepare paper sell for ${symbol} (${escapeHtml(type)})">Sell</button>` : '—';
+      return `<tr><td><strong>${symbol}</strong><small>${escapeHtml(type)}</small></td><td>${number(item.quantity)}</td><td>${price(item.entry_price)}</td><td>${price(item.mark_price)}<small>${escapeHtml(item.mark_source || 'Unmarked')}${item.mark_timestamp ? ` · ${item.mark_source === 'manual' ? 'Recorded' : 'Observed'}: ${escapeHtml(item.mark_timestamp)}` : ''}</small></td><td class="${present(item.unrealized_pnl) && Number(item.unrealized_pnl) > 0 ? 'positive' : present(item.unrealized_pnl) && Number(item.unrealized_pnl) < 0 ? 'negative' : ''}">${money(item.unrealized_pnl)}</td><td><form class="mark-form" data-id="${escapeHtml(id)}"><input type="number" min="0.000000000000000001" step="any" name="price" required aria-label="New mark price for ${symbol} (${escapeHtml(type)})" placeholder="Price" value="${escapeHtml(markDrafts.get(id) || '')}"><button class="button button-secondary" type="submit"${markPending.has(id) ? ' disabled' : ''}>Update</button></form></td><td>${sell}</td></tr>`;
+    }).join('');
+    if (activeMark !== null) {
+      const restored = $$('.mark-form', $('#positions-body')).find(form => form.dataset.id === activeMark);
+      if (restored) restored.elements.price.focus({preventScroll:true});
+    }
   }
   function renderTrades(items) {
     items = Array.isArray(items) ? items : []; $('#trades-empty').hidden = items.length > 0;
@@ -389,23 +413,101 @@
     }, 'Stock market data key cleared.');
     button.disabled = !state.marketData?.has_api_key;
   });
+  function replaceTradeDraft() {
+    const form = $('#trade-form');
+    const hasDraft = ['symbol', 'quantity', 'price', 'reason'].some(name => form.elements[name].value !== '' || form.elements[name].validity.badInput) || form.elements.asset_type.value !== 'stock' || form.elements.side.value !== 'BUY';
+    if (hasDraft && !window.confirm('Replace the unsaved paper trade form? Your current entries will be cleared.')) return false;
+    form.reset();
+    $('#quote-prefill').hidden = true;
+    return true;
+  }
+  function focusTradeForm(name) {
+    if ($('#page-ledger').hidden) $('[data-page="ledger"]').click();
+    const form = $('#trade-form');
+    form.scrollIntoView({block:'start', behavior:'auto'});
+    form.elements[name].focus({preventScroll:true});
+  }
+  $$('[data-holdings-filter]').forEach(button => button.addEventListener('click', () => {
+    state.holdingsFilter = button.dataset.holdingsFilter;
+    renderPositions(state.dashboard?.positions);
+  }));
+  $$('[data-add-holding]').forEach(button => button.addEventListener('click', () => {
+    if (!replaceTradeDraft()) return;
+    const type = button.dataset.addHolding, form = $('#trade-form');
+    form.elements.asset_type.value = type;
+    form.elements.side.value = 'BUY';
+    const prefill = $('#quote-prefill');
+    prefill.textContent = `Paper ${type} BUY prepared. Enter a symbol, quantity, quote price and reason; nothing has been submitted.`;
+    prefill.hidden = false;
+    focusTradeForm('symbol');
+  }));
+  $('#positions-body').addEventListener('click', event => {
+    const button = event.target.closest('[data-sell-position]');
+    if (!button || !event.currentTarget.contains(button)) return;
+    const position = state.dashboard?.positions?.find(item => String(item.id) === button.dataset.sellPosition);
+    if (!position || !['stock', 'crypto'].includes(position.asset_type) || !position.symbol || !present(position.quantity) || Number(position.quantity) <= 0) { notice('That holding is no longer available. Refresh and try again.', true); return; }
+    if (!replaceTradeDraft()) return;
+    const form = $('#trade-form');
+    form.elements.symbol.value = position.symbol;
+    form.elements.asset_type.value = position.asset_type;
+    form.elements.side.value = 'SELL';
+    const prefill = $('#quote-prefill');
+    prefill.textContent = `Paper SELL prepared for ${position.symbol} (${position.asset_type}). Enter quantity, quote price and reason; nothing has been submitted.`;
+    prefill.hidden = false;
+    focusTradeForm('quantity');
+  });
   $('#candidates-body').addEventListener('click', event => {
     const button = event.target.closest('[data-use-quote]');
     if (!button || !event.currentTarget.contains(button)) return;
     const candidate = state.dashboard?.candidates?.[Number(button.dataset.useQuote)];
     if (!candidate || candidate.asset_type !== 'stock' || !candidate.symbol || !present(candidate.price_usd) || Number(candidate.price_usd) <= 0) { notice('That stock quote is no longer available. Refresh and try again.', true); return; }
+    if (!replaceTradeDraft()) return;
     const form = $('#trade-form');
-    form.reset(); form.elements.symbol.value = candidate.symbol; form.elements.asset_type.value = 'stock'; form.elements.price.value = String(candidate.price_usd);
+    form.elements.symbol.value = candidate.symbol; form.elements.asset_type.value = 'stock'; form.elements.price.value = String(candidate.price_usd);
     const prefill = $('#quote-prefill');
     prefill.textContent = `Prefilled ${candidate.symbol} from ${candidate.source || 'an unavailable source'}, ${candidate.cache_status === 'manual' ? 'user-supplied date' : 'trading day'} ${candidate.quote_date || 'unavailable'}. ${stockQuoteStatus(candidate)}. This quote may be delayed or stale${candidate.cache_status === 'manual' ? ' and is not independently verified' : ''}; verify it, then enter quantity and reason and submit manually.`;
     prefill.hidden = false;
-    $('[data-page="ledger"]').click(); form.elements.quantity.focus();
+    focusTradeForm('quantity');
   });
   $('#trade-form').addEventListener('input', event => { if (['symbol', 'asset_type', 'price'].includes(event.target.name)) $('#quote-prefill').hidden = true; });
   $('#trade-form').addEventListener('change', event => { if (['symbol', 'asset_type', 'price'].includes(event.target.name)) $('#quote-prefill').hidden = true; });
   $('#auto-toggle').addEventListener('click', event => { const button = event.currentTarget; const next = button.getAttribute('aria-checked') !== 'true'; runAction(button, async () => { await api('/api/settings', json('PUT', {auto_paper:next})); await refreshAfterMutation(() => refreshDashboard()); }, next ? 'Automatic paper execution enabled.' : 'Automatic paper execution stopped.'); });
-  $('#trade-form').addEventListener('submit', event => { event.preventDefault(); const form = event.currentTarget, submit = $('button[type=submit]', form); const data = Object.fromEntries(new FormData(form)); data.symbol = data.symbol.trim().toUpperCase(); data.reason = data.reason.trim(); data.quantity = Number(data.quantity); data.price = Number(data.price); if (!data.symbol || !data.reason) { notice('Symbol and reason are required.', true); return; } runAction(submit, async () => { await api('/api/trades', json('POST',data)); form.reset(); $('#quote-prefill').hidden = true; await refreshAfterMutation(() => refreshDashboard(true)); }, 'Paper trade recorded.'); });
-  $('#positions-body').addEventListener('submit', event => { if (!event.target.matches('.mark-form')) return; event.preventDefault(); const form = event.target; runAction($('button', form), async () => { await api(`/api/positions/${encodeURIComponent(form.dataset.id)}/mark`, json('PATCH',{price:Number(form.elements.price.value)})); if (form.contains(document.activeElement)) document.activeElement.blur(); await refreshAfterMutation(() => refreshDashboard(true)); }, 'Mark price updated.'); });
+  $('#trade-form').addEventListener('submit', event => {
+    event.preventDefault();
+    const form = event.currentTarget, submit = $('button[type=submit]', form);
+    const draft = Object.fromEntries(new FormData(form));
+    const data = {...draft, symbol:draft.symbol.trim().toUpperCase(), reason:draft.reason.trim(), quantity:Number(draft.quantity), price:Number(draft.price)};
+    if (!data.symbol || !data.reason) { notice('Symbol and reason are required.', true); return; }
+    runAction(submit, async () => {
+      await api('/api/trades', json('POST',data));
+      // Do not erase a different draft entered while the paper order was in flight.
+      if (Object.keys(draft).every(key => form.elements[key].value === draft[key])) { form.reset(); $('#quote-prefill').hidden = true; }
+      await refreshAfterMutation(() => refreshDashboard(true));
+    }, 'Paper trade recorded.');
+  });
+  $('#positions-body').addEventListener('input', event => {
+    if (!event.target.matches('.mark-form input')) return;
+    const id = event.target.closest('.mark-form').dataset.id;
+    if (event.target.value) markDrafts.set(id, event.target.value); else markDrafts.delete(id);
+  });
+  $('#positions-body').addEventListener('submit', event => {
+    if (!event.target.matches('.mark-form')) return;
+    event.preventDefault();
+    const form = event.target, id = form.dataset.id, value = form.elements.price.value;
+    if (markPending.has(id)) return;
+    markPending.add(id);
+    runAction($('button', form), async () => {
+      try {
+        await api(`/api/positions/${encodeURIComponent(id)}/mark`, json('PATCH',{price:Number(value)}));
+        if (markDrafts.get(id) === value) markDrafts.delete(id);
+        await refreshAfterMutation(() => refreshDashboard(true));
+      } finally {
+        markPending.delete(id);
+        const current = $$('.mark-form', $('#positions-body')).find(item => item.dataset.id === id);
+        if (current) $('button', current).disabled = false;
+      }
+    }, 'Mark price updated.');
+  });
   $('#settings-form').addEventListener('submit', event => { event.preventDefault(); const form = event.currentTarget; const data = {}; settingFields.forEach(key => { data[key] = Number(form.elements[key].value); }); data.auto_paper = form.elements.auto_paper.checked; runAction($('button[type=submit]',form), async () => { await api('/api/settings',json('PUT',data)); await refreshAfterMutation(() => refreshDashboard()); }, 'Trading settings saved.'); });
   $('#provider-select').addEventListener('change', event => { state.providerId = event.target.value; fillProvider(); });
   $('#provider-form').addEventListener('submit', event => { event.preventDefault(); const form = event.currentTarget, id = state.providerId; if (!id) return; const data = {name:form.elements.name.value.trim(),kind:form.elements.kind.value.trim(),base_url:form.elements.base_url.value.trim(),model:form.elements.model.value.trim(),clear_key:form.elements.clear_key.checked,enabled:form.elements.enabled.checked}; const key = form.elements.api_key.value; if (key && data.clear_key) { notice('Choose either a new API key or clear the saved key, not both.', true); return; } if (key) data.api_key = key; runAction($('button[type=submit]',form), async () => { await api(`/api/llm/${encodeURIComponent(id)}`,json('PUT',data)); form.elements.api_key.value = ''; await refreshProviders(); }, 'Provider settings saved.'); });

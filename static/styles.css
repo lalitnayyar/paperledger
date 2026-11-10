@@ -24,3 +24,19 @@ html[data-theme=light] .agent-row:nth-child(2) .agent-icon{color:#966c27}html[da
 .stock-scan-context{color:var(--text)!important;font-weight:650;overflow-wrap:anywhere}
 .stock-settings-status{color:var(--muted);font-size:10px;line-height:1.5;white-space:pre-line;overflow-wrap:anywhere}
 .manual-import-panel textarea{min-height:110px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+
+/* Holdings filters affect this list only; the account and trade ledger remain unchanged. */
+.holdings-head{align-items:flex-start;flex-wrap:wrap}
+.holdings-head>div:first-child{max-width:590px}
+.holdings-actions{display:flex;gap:7px;flex-wrap:wrap}
+.holdings-actions .button{min-height:34px}
+.holdings-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:0 21px 16px}
+.holdings-filters{display:flex;gap:5px;flex-wrap:wrap}
+.holdings-filters button{display:inline-flex;align-items:center;gap:8px;min-height:34px;padding:0 11px;border:1px solid var(--border);border-radius:3px;background:var(--input);color:var(--muted);font-size:11px;font-weight:700}
+.holdings-filters button:hover{border-color:var(--accent);color:var(--text)}
+.holdings-filters button[aria-pressed=true]{border-color:var(--accent);background:var(--accent-bg);color:var(--accent)}
+.holdings-filters button span{font-size:10px;font-variant-numeric:tabular-nums}
+#holdings-count{color:var(--muted);font-size:10px;line-height:1.4}
+.holdings-panel td small{white-space:normal;max-width:200px;overflow:visible;text-overflow:clip;line-height:1.5;overflow-wrap:anywhere}
+.sell-holding{min-height:30px;padding:0 10px}
+@media(max-width:600px){.holdings-head{gap:12px}.holdings-actions{width:100%}.holdings-actions .button{flex:1}.holdings-toolbar{padding:0 16px 15px}}
