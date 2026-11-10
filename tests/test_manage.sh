@@ -36,7 +36,7 @@ s=$TEST_STATE
 { for arg in "$@"; do printf '%s\t' "$arg"; done; printf '\n'; } >> "$TEST_LOG"
 cmd=${1-}; [ "$#" -gt 0 ] && shift
 case "$cmd" in
- info) exit 0 ;;
+ info) [ ! -f "$s/fail_info" ] || exit 1; exit 0 ;;
  compose)
     if [ "${1-}" = version ]; then exit 0; fi
     [ -z "${APP_PORT+x}" ] || touch "$s/shell_port_leaked"
@@ -58,20 +58,36 @@ case "$cmd" in
                 [ ! -f "$s/second" ] || printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                 exit 0
             fi; done; exit 0 ;;
-        up) [ ! -f "$s/fail_up" ] || { printf 'simulated port conflict\n' >&2; exit 1; }
+        up) touch "$s/up_called"
+            [ ! -f "$s/leak_up" ] || { printf 'compose-output-secret\n'; printf 'compose-error-secret\n' >&2; }
+            [ ! -f "$s/fail_up" ] || { printf 'simulated port conflict\n' >&2; exit 1; }
             if [ -n "$env_file" ]; then
                 p=$(awk -F= '/^APP_PORT=[0-9]+$/ { p=$2 } END { print p }' "$env_file")
                 [ -z "$p" ] || printf '%s\n' "$p" > "$s/port"
+                for arg in "$@"; do
+                    if [ "$arg" = --force-recreate ] && [ ! -f "$s/stale_mapping" ]; then
+                        bind=$(awk -F= '/^APP_BIND_ADDR=(127\.0\.0\.1|0\.0\.0\.0)$/ { b=$2 } END { print b }' "$env_file")
+                        [ -z "$bind" ] || printf '%s\n' "$bind" > "$s/bind"
+                    fi
+                done
             fi
             touch "$s/container" "$s/running" "$s/volume" "$s/image" ;;
         port) [ ! -f "$s/fail_port" ] || exit 1
-              if [ -f "$s/reported_port" ]; then cat "$s/reported_port"; else printf '127.0.0.1:%s\n' "$(cat "$s/port")"; fi ;;
+              if [ -f "$s/up_called" ] && [ -f "$s/fail_port_after_up" ]; then exit 1
+              elif [ -f "$s/up_called" ] && [ -f "$s/reported_after_up" ]; then cat "$s/reported_after_up"
+              elif [ -f "$s/reported_port" ]; then cat "$s/reported_port"
+              elif [ -f "$s/bind" ]; then printf '%s:%s\n' "$(cat "$s/bind")" "$(cat "$s/port")"
+              else printf '127.0.0.1:%s\n' "$(cat "$s/port")"; fi ;;
         exec)
             [ "${1-}" = -T ] && [ "${2-}" = ledger ] && [ "${3-}" = python ] && [ "${4-}" = -m ] && [ "${5-}" = app.user_cli ] || exit 2
             shift 5
             [ -f "$s/running" ] || exit 1
             case "${1-}" in
-                admin-exists) [ -f "$s/active_admin" ] || exit 1 ;;
+                admin-exists) [ -f "$s/active_admin" ] || exit 1
+                    if [ -f "$s/fail_admin_recheck" ]; then
+                        if [ -f "$s/admin_checked" ]; then exit 1; fi
+                        touch "$s/admin_checked"
+                    fi ;;
                 list) printf '%s\n' 'alice admin active' ;;
                 create|password)
                     [ -z "${secret_pw+x}" ] || touch "$s/secret_exported"
@@ -428,7 +444,7 @@ cmp -s "$APP/.env" "$CASE/before" || fail 'unresolved port modified .env'
 fixture
 # Hide Python while retaining the commands required by the script and mock.
 mkdir "$CASE/no-python"
-for tool in bash dirname cat chmod awk mktemp mv mkdir date touch rm; do
+for tool in bash dirname cat chmod awk od mktemp mv mkdir date touch rm; do
     ln -s "$(command -v "$tool")" "$CASE/no-python/$tool"
 done
 saved_path=$PATH
@@ -583,7 +599,7 @@ cmp -s "$CASE/expected" "$APP/.env" || fail 'network writer did not preserve oth
 is_private_file "$APP/.env" || fail 'network .env not mode 600'
 not_contains "$CASE/out" 'do-not-display-this'
 contains "$CASE/out" 'NOT automatically applied'
-contains "$CASE/out" 'docker compose up -d --build'
+contains "$CASE/out" 'choose option 1 (install/build/start)'
 not_contains "$STATE/log" $'up\t-d'
 run_menu '15\n1\n0\n'
 contains "$APP/.env" 'APP_BIND_ADDR=127.0.0.1'
@@ -633,6 +649,241 @@ cp "$APP/.env" "$CASE/before"
 run_menu '15\n1\n0\n'
 cmp -s "$CASE/before" "$APP/.env" || fail 'unclosed other multiline setting was altered'
 contains "$CASE/out" 'Could not safely update .env'
+
+# Network changes require two separate confirmations for wildcard exposure:
+# the original opt-in/admin check, then an exact YES for recreation. A normal
+# Compose restart is never used and no data or credentials are deleted.
+assert_network_data_preserved() {
+    [ -f "$STATE/volume" ] && [ -f "$STATE/image" ] && [ -f "$STATE/active_admin" ] || fail 'network operation removed data resources or accounts'
+    [ "$(cat "$STATE/data/ledger.txt")" = 'original ledger' ] || fail 'network operation changed ledger data'
+    not_contains "$STATE/log" $'down\t'
+    not_contains "$STATE/log" $'volume\trm\t'
+    not_contains "$STATE/log" $'image\trm\t'
+    not_contains "$STATE/log" $'restart\t'
+    not_contains "$STATE/log" $'app.user_cli\tdelete\t'
+}
+
+for answer in '' no yes 0; do
+    fixture
+    touch "$STATE/active_admin"
+    printf 'APP_PORT=52533\nAPP_BIND_ADDR=127.0.0.1\nSECRET=do-not-print-network-secret\n' > "$APP/.env"
+    printf '52533\n' > "$STATE/port"
+    run_menu "15\n2\nENABLE NETWORK\n$answer\n0\n"
+    contains "$APP/.env" 'APP_BIND_ADDR=0.0.0.0'
+    contains "$CASE/out" 'Type YES to apply'
+    contains "$CASE/out" 'Network setting saved but NOT automatically applied'
+    contains "$CASE/out" 'choose option 1 (install/build/start)'
+    contains "$CASE/out" 'Restart (option 6) does not recreate'
+    not_contains "$CASE/out" 'do-not-print-network-secret'
+    not_contains "$CASE/out" 'Network mapping verified'
+    not_contains "$STATE/log" $'up\t-d'
+    assert_network_data_preserved
+done
+
+fixture
+touch "$STATE/active_admin" "$STATE/leak_up"
+cat > "$APP/.env" <<'ENV'
+APP_PORT=52533
+APP_BIND_ADDR=127.0.0.1
+APP_AUTH_USER=existing-user-secret
+APP_AUTH_HASH=existing-hash-secret
+SECRET_KEY=do-not-print-network-secret
+ENV
+cp "$APP/.env" "$CASE/before"
+sed 's/^APP_BIND_ADDR=.*/APP_BIND_ADDR=0.0.0.0/' "$CASE/before" > "$CASE/expected"
+printf '52533\n' > "$STATE/port"
+export APP_PORT=23456 APP_BIND_ADDR=127.0.0.1 APP_AUTH_ENABLED=0 APP_AUTH_USER=override-user APP_AUTH_HASH=override-hash
+run_menu '15\n2\nENABLE NETWORK\nYES\n0\n'
+unset APP_PORT APP_BIND_ADDR APP_AUTH_ENABLED APP_AUTH_USER APP_AUTH_HASH
+cmp -s "$CASE/expected" "$APP/.env" || fail 'wildcard apply changed port or credential settings'
+is_private_file "$APP/.env" || fail 'applied configuration is not private'
+contains "$STATE/log" $'up\t-d\t--build\t--force-recreate\tledger\t'
+contains "$STATE/log" "${APP}/.env"
+[ "$(grep -Fc $'app.user_cli\tadmin-exists\t' "$STATE/log")" = 2 ] || fail 'active admin was not rechecked before wildcard recreation'
+contains "$CASE/out" 'Network mapping verified from Docker: 0.0.0.0:52533 -> ledger:8000'
+contains "$CASE/out" 'Published URL: http://127.0.0.1:52533'
+contains "$CASE/out" 'Unverified LAN template: http://<LAN-IP>:52533'
+contains "$CASE/out" 'Unverified Tailscale template: http://<TAILSCALE-IP>:52533'
+not_contains "$CASE/out" 'existing-user-secret'
+not_contains "$CASE/out" 'existing-hash-secret'
+not_contains "$CASE/out" 'do-not-print-network-secret'
+not_contains "$CASE/out" 'compose-output-secret'
+not_contains "$CASE/out" 'compose-error-secret'
+for flag in shell_port_leaked shell_bind_leaked shell_auth_leaked shell_auth_user_leaked shell_auth_hash_leaked; do
+    [ ! -f "$STATE/$flag" ] || fail "inherited $flag reached network recreation"
+done
+assert_network_data_preserved
+
+fixture
+touch "$STATE/active_admin"
+printf 'APP_PORT=52533\nAPP_BIND_ADDR=0.0.0.0\nSECRET=do-not-print-network-secret\n' > "$APP/.env"
+printf '52533\n' > "$STATE/port"
+printf '0.0.0.0\n' > "$STATE/bind"
+export APP_BIND_ADDR=0.0.0.0 APP_PORT=12345
+run_menu '15\n1\nYES\n3\n0\n'
+unset APP_BIND_ADDR APP_PORT
+contains "$STATE/log" $'up\t-d\t--build\t--force-recreate\tledger\t'
+contains "$APP/.env" 'APP_PORT=52533'
+contains "$APP/.env" 'APP_BIND_ADDR=127.0.0.1'
+contains "$CASE/out" 'Network mapping verified from Docker: 127.0.0.1:52533 -> ledger:8000'
+contains "$CASE/out" 'Published URL: http://127.0.0.1:52533'
+contains "$CASE/out" 'Docker mapping: 127.0.0.1:52533 -> ledger:8000'
+contains "$CASE/out" 'Network scope: loopback only'
+contains "$CASE/out" 'Restart (option 6) does not recreate'
+not_contains "$CASE/out" 'Unverified LAN template:'
+not_contains "$CASE/out" 'Unverified Tailscale template:'
+not_contains "$CASE/out" 'do-not-print-network-secret'
+[ ! -f "$STATE/shell_bind_leaked" ] && [ ! -f "$STATE/shell_port_leaked" ] || fail 'inherited settings exposed localhost apply'
+assert_network_data_preserved
+
+fixture
+touch "$STATE/active_admin" "$STATE/stale_mapping"
+printf 'APP_PORT=52533\nAPP_BIND_ADDR=127.0.0.1\n' > "$APP/.env"
+printf '52533\n' > "$STATE/port"
+run_menu '15\n2\nENABLE NETWORK\nYES\n0\n'
+contains "$APP/.env" 'APP_BIND_ADDR=0.0.0.0'
+contains "$CASE/out" 'Docker reported 127.0.0.1:52533 after recreation, not the requested 0.0.0.0:52533'
+contains "$CASE/out" 'Configuration saved, but network NOT verified'
+contains "$CASE/out" 'retry option 15'
+not_contains "$CASE/out" 'Network mapping verified'
+not_contains "$CASE/out" 'Published URL:'
+not_contains "$CASE/out" 'Unverified LAN template:'
+not_contains "$CASE/out" 'Unverified Tailscale template:'
+assert_network_data_preserved
+
+fixture
+touch "$STATE/active_admin" "$STATE/stale_mapping"
+printf 'APP_PORT=52533\nAPP_BIND_ADDR=0.0.0.0\n' > "$APP/.env"
+printf '52533\n' > "$STATE/port"
+printf '0.0.0.0\n' > "$STATE/bind"
+run_menu '15\n1\nYES\n0\n'
+contains "$CASE/out" 'Docker reported 0.0.0.0:52533 after recreation, not the requested 127.0.0.1:52533'
+contains "$CASE/out" 'Do not assume the requested access restriction'
+contains "$CASE/out" 'Configuration saved, but network NOT verified'
+not_contains "$CASE/out" 'Network mapping verified'
+not_contains "$CASE/out" 'Unverified LAN template:'
+assert_network_data_preserved
+
+# A correct IP with the wrong port, garbage, multiple mappings, blank extra
+# lines, and an unavailable post-recreation port response must never pass.
+for mapping in wrong-port junk multiple extra-blank nul failed; do
+    fixture
+    touch "$STATE/active_admin"
+    printf 'APP_PORT=52533\nAPP_BIND_ADDR=127.0.0.1\n' > "$APP/.env"
+    printf '52533\n' > "$STATE/port"
+    case "$mapping" in
+        wrong-port) printf '0.0.0.0:8080\n' > "$STATE/reported_after_up" ;;
+        junk) printf '0.0.0.0:52533 junk\n' > "$STATE/reported_after_up" ;;
+        multiple) printf '0.0.0.0:52533\n127.0.0.1:52533\n' > "$STATE/reported_after_up" ;;
+        extra-blank) printf '0.0.0.0:52533\n\n' > "$STATE/reported_after_up" ;;
+        nul) printf '0.0.0.0:525\00033\n' > "$STATE/reported_after_up" ;;
+        failed) touch "$STATE/fail_port_after_up" ;;
+    esac
+    run_menu '15\n2\nENABLE NETWORK\nYES\n0\n'
+    contains "$STATE/log" $'up\t-d\t--build\t--force-recreate\tledger\t'
+    contains "$CASE/out" 'Configuration saved, but network NOT verified'
+    not_contains "$CASE/out" 'Network mapping verified'
+    not_contains "$CASE/out" 'Published URL:'
+    not_contains "$CASE/out" 'Unverified LAN template:'
+    assert_network_data_preserved
+done
+
+fixture
+touch "$STATE/active_admin" "$STATE/fail_up" "$STATE/leak_up"
+printf 'APP_PORT=52533\nAPP_BIND_ADDR=127.0.0.1\nSECRET=do-not-print-network-secret\n' > "$APP/.env"
+printf '52533\n' > "$STATE/port"
+run_menu '15\n2\nENABLE NETWORK\nYES\n0\n'
+contains "$CASE/out" 'Docker build or recreation failed'
+contains "$CASE/out" 'Configuration saved, but network NOT verified'
+contains "$CASE/out" 'retry option 15'
+not_contains "$CASE/out" 'Network mapping verified'
+not_contains "$CASE/out" 'compose-output-secret'
+not_contains "$CASE/out" 'compose-error-secret'
+not_contains "$CASE/out" 'do-not-print-network-secret'
+assert_network_data_preserved
+
+# An old container may publish a shell-overridden port rather than .env's port.
+# Neither mismatch nor an unknown current mapping may silently change that port.
+fixture
+touch "$STATE/active_admin"
+printf 'APP_PORT=8080\nAPP_BIND_ADDR=127.0.0.1\n' > "$APP/.env"
+printf '52533\n' > "$STATE/port"
+run_menu '15\n2\nENABLE NETWORK\nYES\n0\n'
+contains "$CASE/out" 'Current Docker mapping is 127.0.0.1:52533, but configured APP_PORT is 8080'
+contains "$CASE/out" 'choose option 9 and enter 52533 (REUSE if prompted)'
+contains "$CASE/out" 'Configuration saved, but network NOT verified'
+not_contains "$STATE/log" $'up\t-d'
+not_contains "$CASE/out" 'Network mapping verified'
+assert_network_data_preserved
+
+fixture
+touch "$STATE/active_admin" "$STATE/fail_port"
+printf 'APP_PORT=52533\nAPP_BIND_ADDR=127.0.0.1\n' > "$APP/.env"
+run_menu '15\n2\nENABLE NETWORK\nYES\n0\n'
+contains "$CASE/out" 'Cannot determine the current Docker mapping'
+contains "$CASE/out" 'no recreation was attempted'
+contains "$CASE/out" 'Configuration saved, but network NOT verified'
+not_contains "$STATE/log" $'up\t-d'
+assert_network_data_preserved
+
+fixture
+touch "$STATE/active_admin"
+# shellcheck disable=SC2016
+printf 'APP_PORT=$(touch %s/pwned)\nAPP_BIND_ADDR=127.0.0.1\nSECRET=do-not-print-network-secret\n' "$CASE" > "$APP/.env"
+run_menu '15\n2\nENABLE NETWORK\nYES\n0\n'
+contains "$CASE/out" 'Cannot determine a simple valid configured APP_PORT'
+contains "$CASE/out" 'Configuration saved, but network NOT verified'
+[ ! -e "$CASE/pwned" ] || fail '.env content was evaluated as shell code'
+not_contains "$CASE/out" 'do-not-print-network-secret'
+not_contains "$STATE/log" $'up\t-d'
+assert_network_data_preserved
+
+fixture
+touch "$STATE/active_admin" "$STATE/fail_info"
+printf 'APP_PORT=52533\nAPP_BIND_ADDR=0.0.0.0\n' > "$APP/.env"
+run_menu '15\n1\nYES\n0\n'
+contains "$APP/.env" 'APP_BIND_ADDR=127.0.0.1'
+contains "$CASE/out" 'Cannot access the Docker daemon'
+contains "$CASE/out" 'Configuration saved, but network NOT verified'
+not_contains "$STATE/log" $'up\t-d'
+assert_network_data_preserved
+
+fixture
+printf '52533\n' > "$STATE/port"
+mkdir "$CASE/no-curl"
+for tool in bash dirname cat od; do ln -s "$(command -v "$tool")" "$CASE/no-curl/$tool"; done
+saved_path=$PATH
+export PATH="$CASE/bin:$CASE/no-curl"
+run_menu '3\n0\n'
+export PATH=$saved_path
+contains "$CASE/out" 'Docker mapping: 127.0.0.1:52533 -> ledger:8000'
+contains "$CASE/out" 'Network scope: loopback only'
+contains "$CASE/out" 'curl is not installed; local HTTP health check skipped'
+contains "$CASE/out" 'Restart (option 6) does not recreate'
+
+# The old image, stopped service, or an absent/disabled admin all fail closed;
+# an admin removed while the user answers the prompt is also detected.
+fixture
+printf 'APP_PORT=52533\nAPP_BIND_ADDR=127.0.0.1\n' > "$APP/.env"
+cp "$APP/.env" "$CASE/before"
+run_menu '15\n2\nENABLE NETWORK\n0\n'
+cmp -s "$CASE/before" "$APP/.env" || fail 'failed old-image/admin check changed config'
+contains "$CASE/out" 'app/image may be old'
+contains "$CASE/out" 'option 15, then 1 for localhost only'
+contains "$CASE/out" 'option 1 to rebuild localhost (REUSE if prompted)'
+contains "$CASE/out" 'first administrator with option 16'
+not_contains "$STATE/log" $'up\t-d'
+
+fixture
+touch "$STATE/active_admin" "$STATE/fail_admin_recheck"
+printf 'APP_PORT=52533\nAPP_BIND_ADDR=127.0.0.1\n' > "$APP/.env"
+printf '52533\n' > "$STATE/port"
+run_menu '15\n2\nENABLE NETWORK\nYES\n0\n'
+contains "$APP/.env" 'APP_BIND_ADDR=0.0.0.0'
+contains "$CASE/out" 'Cannot confirm an active administrator'
+contains "$CASE/out" 'Configuration saved, but network NOT verified'
+not_contains "$STATE/log" $'up\t-d'
+assert_network_data_preserved
 
 # Ignore inherited settings both with and without an environment file, while
 # leaving the externally supplied encryption key available to Compose.

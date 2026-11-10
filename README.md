@@ -137,13 +137,28 @@ Administrators can manage users and change application and provider settings. St
 ### Localhost, LAN IP, and Tailscale IP
 
 1. Start the app in its default localhost-only mode and create an administrator using **User administration** (option **16**) in `bash manage.sh`.
-2. In the manager's **Network access** option (**15**), select access on all IPv4 interfaces (**2**). Read the warning and type `ENABLE NETWORK` to confirm, then choose **Install / build / start** to apply it. The named data volume is preserved. The manager does not install Tailscale or change firewall settings.
+2. In the manager's **Network access** option (**15**), select access on all IPv4 interfaces (**2**). Read the warning and type `ENABLE NETWORK` to confirm. When offered, type `YES` to apply the setting now so Docker rebuilds and recreates the service. The named data volume is preserved. The manager does not install Tailscale or change firewall settings.
 3. On the Docker or forwarding host, find its LAN IPv4 address in your operating system's network settings. If Tailscale is installed on that host, `tailscale ip -4` shows its Tailscale IPv4 address. The manager's port display is the source for the port number.
 4. Open `http://127.0.0.1:PORT` on the host, `http://LAN-IP:PORT` from an allowed LAN device, or `http://TAILSCALE-IP:PORT` from an allowed device on the same tailnet. Replace the placeholders with the actual address and port, and sign in. Tailscale access requires Tailscale to be connected and policy to permit traffic on both devices.
 
 `0.0.0.0` is a wildcard bind address, not a browser address. It exposes the port on **all reachable IPv4 interfaces**, not just Tailscale; it may include public-facing interfaces. Restrict access using the effective Docker/host firewall and tailnet policies, do not enable router port forwarding, and verify access from the intended and unintended networks. Docker can bypass conventional Linux UFW rules. On Docker Desktop, Windows/WSL, or a remote daemon, the host's addresses and forwarding behavior can differ from those of the shell running the manager. These addresses and peer connectivity are not automatically verified.
 
 **LAN HTTP is unencrypted:** anyone able to observe the traffic can potentially see passwords, session cookies, ledger data, and settings. Prefer Tailscale between devices, and use LAN HTTP only on a trusted network. Tailscale encrypts the connection between its devices, but does not prevent an authorized peer from using the app. Switching back to localhost-only in the manager requires rebuilding/recreating the service to take effect; account data is retained.
+
+#### Troubleshooting: the app only opens on localhost
+
+Run `docker compose ps` in the project directory. A mapping such as `127.0.0.1:52533->8000/tcp` means the running container is published **only on localhost**, even if the service is healthy. A simple container restart does not apply an updated Compose port mapping; the container must be recreated.
+
+On a Git checkout, pull the latest update and start the network-repair helper:
+
+```bash
+git pull --ff-only
+bash fix-network.sh
+```
+
+The helper opens the manager and explains the steps; it does not change the bind address without your confirmation. If the installed image is older and the manager cannot detect an administrator, first choose **1** to build/start the updated localhost service, use **16** to create an administrator if needed, then choose **15 → 2**, type `ENABLE NETWORK`, and type `YES` to apply. The manager verifies the Docker-reported address and port. It will warn if the running port differs from the configured port rather than silently changing it. An optional `bash fix-network.sh --update` pulls the configured Git upstream before opening the manager; it requires a clean tracked working tree. Neither path deletes the data volume.
+
+Afterward, `docker compose ps` should show `0.0.0.0:PORT->8000/tcp` for the IPv4 mapping. Use `http://LAN-IP:PORT` or `http://TAILSCALE-IP:PORT` in the browser—not `0.0.0.0`. If the wildcard mapping is present but another device still cannot connect, check that the IP belongs to the actual Docker/forwarding host, the device is on the intended LAN or tailnet, and the effective firewall and Tailscale policies allow the connection. A wildcard mapping alone does not prove remote reachability. Do not post `.env` or API keys when requesting help.
 
 ### Stocks, crypto, or both
 
@@ -247,6 +262,7 @@ APP_AUTH_ENABLED=0 APP_BIND_ADDR=127.0.0.1 DATA_DIR=./data uvicorn app.main:app 
 pytest -q
 bash tests/test_manage.sh
 bash tests/test_deploy.sh
+bash tests/test_fix_network.sh
 ```
 
 The command above intentionally disables login **only for localhost development**. Never bind that mode to a network interface. Docker deployments always enable authentication. On Windows, activate with `.venv\Scripts\Activate.ps1` and set `$env:DATA_DIR = './data'`, `$env:APP_AUTH_ENABLED = '0'`, and `$env:APP_BIND_ADDR = '127.0.0.1'` for that development command. The Python tests exercise the ledger, scanner, providers, and authentication; the administration tests use mocked Docker and isolated local Git repositories, not a real Docker daemon. A real Docker build and restore should be verified on the target host before relying on them. If the scanner fails, check your internet connection, service availability and provider rate limits. No scan or AI result is invented if an upstream request fails. If Ollama fails, check its listening address, model name, and accessibility from inside Docker. If saved API keys stop decrypting, restore the original encryption key or clear and re-enter the credentials.

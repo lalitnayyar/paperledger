@@ -582,8 +582,22 @@ choose_port() {
 # Accept exactly one loopback or wildcard IPv4 endpoint and a numeric valid port.
 # Never construct URLs from arbitrary Docker output or guess among multiple mappings.
 published_endpoint() {
-    local endpoint port
-    endpoint=$(compose port "$SERVICE" 8000 2>/dev/null) || return 1
+    local endpoint='' port bytes byte ended=0
+    # Parse bytes before command substitution can discard NULs or newlines.
+    # Accept only digits, dots, colon and at most one final newline. od is
+    # POSIX and avoids evaluating or printing arbitrary Docker output.
+    bytes=$(compose port "$SERVICE" 8000 2>/dev/null | LC_ALL=C od -An -v -t x1 2>/dev/null) || return 1
+    for byte in $bytes; do
+        [ "$ended" -eq 0 ] || return 1
+        case "$byte" in
+            30|31|32|33|34|35|36|37|38|39) endpoint="$endpoint${byte#3}" ;;
+            2e) endpoint="$endpoint." ;;
+            3a) endpoint="$endpoint:" ;;
+            0a) ended=1 ;;
+            *) return 1 ;;
+        esac
+        [ "${#endpoint}" -le 32 ] || return 1
+    done
     case "$endpoint" in
         127.0.0.1:*) PUBLISHED_BIND=127.0.0.1; port=${endpoint#127.0.0.1:} ;;
         0.0.0.0:*) PUBLISHED_BIND=0.0.0.0; port=${endpoint#0.0.0.0:} ;;
@@ -592,11 +606,7 @@ published_endpoint() {
     normalize_port "$port" || return 1
     PUBLISHED_PORT=$VALID_PORT
 }
-show_published_url() {
-    if ! published_endpoint; then
-        printf '%s\n' 'Could not confirm a single loopback or wildcard IPv4 published port from Docker; check Status.'
-        return 1
-    fi
+print_published_url() {
     printf 'Published URL: http://127.0.0.1:%s\n' "$PUBLISHED_PORT"
     if [ "$PUBLISHED_BIND" = 0.0.0.0 ]; then
         printf 'Unverified LAN template: http://<LAN-IP>:%s\n' "$PUBLISHED_PORT"
@@ -605,6 +615,13 @@ show_published_url() {
             'These are templates, not connectivity checks. LAN HTTP has no TLS: passwords and ledger data travel in cleartext.'
     fi
     printf '%s\n' 'This is localhost on the Docker/forwarding host; WSL, Docker Desktop, and remote Docker may have different host access.'
+}
+show_published_url() {
+    if ! published_endpoint; then
+        printf '%s\n' 'Could not confirm a single loopback or wildcard IPv4 published port from Docker; check Status.'
+        return 1
+    fi
+    print_published_url
 }
 do_deploy() {
     check_docker || return 1
@@ -661,13 +678,20 @@ do_status() {
     check_docker || return 1
     compose ps --all "$SERVICE" || return 1
     local port
-    if ! command -v curl >/dev/null 2>&1; then
-        printf '%s\n' 'curl is not installed; local HTTP health check skipped.'
+    printf '%s\n' 'Restart (option 6) does not recreate the container or apply saved network/port changes; use option 1 or option 15 to recreate it.'
+    # Report only parsed Docker output, even if curl is unavailable.
+    if ! published_endpoint; then
+        printf '%s\n' 'Docker mapping: unavailable or invalid. No single valid loopback or wildcard IPv4 published port found; local HTTP health check skipped.'
         return 0
     fi
-    # Only probe loopback after a single recognized Docker endpoint is confirmed.
-    if ! published_endpoint; then
-        printf '%s\n' 'No single valid loopback or wildcard IPv4 published port found; local HTTP health check skipped.'
+    printf 'Docker mapping: %s:%s -> ledger:8000\n' "$PUBLISHED_BIND" "$PUBLISHED_PORT"
+    if [ "$PUBLISHED_BIND" = 127.0.0.1 ]; then
+        printf '%s\n' 'Network scope: loopback only on the Docker/forwarding host; direct LAN or Tailscale access via this mapping is unavailable.'
+    else
+        printf '%s\n' 'Network scope: all IPv4 interfaces on the Docker host; actual reachability is not verified.'
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        printf '%s\n' 'curl is not installed; local HTTP health check skipped.'
         return 0
     fi
     port=$PUBLISHED_PORT
@@ -743,8 +767,63 @@ write_env_setting() {
     TEMP_ENV=
     printf '%s set to %s in protected .env. All other entries were retained.\n' "$key" "$value"
 }
+admin_check_help() {
+    say_error 'Cannot confirm an active administrator in the running service (it may be stopped or the app/image may be old). First choose option 15, then 1 for localhost only; choose option 1 to rebuild localhost (REUSE if prompted), create the first administrator with option 16, then retry option 15.'
+}
+network_unverified() {
+    printf '%s\n' 'Configuration saved, but network NOT verified. Docker may still use the previous mapping or may have partially applied the change; check option 3 Status.' \
+        'After resolving the problem, retry option 15 and answer YES to apply, or choose option 1 to rebuild. Restart (option 6) does not recreate the container.' >&2
+}
+apply_network() {
+    local wanted_bind=$1 wanted_port old_bind old_port
+    if ! check_docker; then network_unverified; return 1; fi
+    if ! configured_port; then
+        say_error 'Cannot determine a simple valid configured APP_PORT; no recreation was attempted. Repair .env or choose a port with option 9 first.'
+        network_unverified
+        return 1
+    fi
+    wanted_port=$CONFIGURED_PORT
+    if ! published_endpoint; then
+        say_error 'Cannot determine the current Docker mapping as a single valid IPv4 endpoint; no recreation was attempted. Check option 3 Status, then choose option 1 and explicitly select the desired port if needed.'
+        network_unverified
+        return 1
+    fi
+    old_bind=$PUBLISHED_BIND
+    old_port=$PUBLISHED_PORT
+    if [ "$old_port" != "$wanted_port" ]; then
+        say_error "Current Docker mapping is $old_bind:$old_port, but configured APP_PORT is $wanted_port; no recreation was attempted. To keep the current port, choose option 9 and enter $old_port (REUSE if prompted), then retry option 15; alternatively choose option 1 and explicitly select your desired port."
+        network_unverified
+        return 1
+    fi
+    # Re-check immediately before exposing the service: the user may have
+    # delayed at the apply prompt or the administrator may have been disabled.
+    if [ "$wanted_bind" = 0.0.0.0 ] && ! compose exec -T "$SERVICE" python -m app.user_cli admin-exists </dev/null >/dev/null 2>&1; then
+        admin_check_help
+        network_unverified
+        return 1
+    fi
+    printf '%s\n' 'Rebuilding and recreating only the ledger service; the named data volume, accounts, credentials and configured port are preserved.'
+    # Do not echo Compose diagnostics, which can include configuration secrets.
+    if ! compose up -d --build --force-recreate "$SERVICE" >/dev/null 2>&1; then
+        say_error 'Docker build or recreation failed; check Docker and whether the configured port is available on its host.'
+        network_unverified
+        return 1
+    fi
+    if ! published_endpoint; then
+        say_error 'Docker did not report a single valid loopback or wildcard IPv4 mapping after recreation.'
+        network_unverified
+        return 1
+    fi
+    if [ "$PUBLISHED_BIND" != "$wanted_bind" ] || [ "$PUBLISHED_PORT" != "$wanted_port" ]; then
+        say_error "Docker reported $PUBLISHED_BIND:$PUBLISHED_PORT after recreation, not the requested $wanted_bind:$wanted_port. Do not assume the requested access restriction or exposure is in effect."
+        network_unverified
+        return 1
+    fi
+    printf 'Network mapping verified from Docker: %s:%s -> ledger:8000\n' "$PUBLISHED_BIND" "$PUBLISHED_PORT"
+    print_published_url
+}
 choose_network() {
-    local choice confirm
+    local choice confirm requested_bind apply
     printf '%s\n' \
         'Network access: 1) Localhost only (127.0.0.1, the default)  2) All IPv4 interfaces (0.0.0.0)  0) Cancel' \
         'When APP_BIND_ADDR is absent, the safe Compose default is 127.0.0.1.'
@@ -755,6 +834,7 @@ choose_network() {
         1)
             create_env_if_missing || return 1
             write_env_setting APP_BIND_ADDR 127.0.0.1 || return 1
+            requested_bind=127.0.0.1
             ;;
         2)
             printf '%s\n' \
@@ -769,17 +849,24 @@ choose_network() {
             # unavailable and no-active-admin cases. Never inspect or modify the DB.
             check_docker || return 1
             if ! compose exec -T "$SERVICE" python -m app.user_cli admin-exists </dev/null >/dev/null 2>&1; then
-                say_error 'Cannot confirm an active administrator in the running service. Start the default localhost service with option 1, then create an administrator with option 16 before enabling network access.'
+                admin_check_help
                 return 1
             fi
             create_env_if_missing || return 1
             write_env_setting APP_BIND_ADDR 0.0.0.0 || return 1
+            requested_bind=0.0.0.0
             ;;
         *) say_error 'Invalid network choice; .env was not changed.'; return 1 ;;
     esac
     printf '%s\n' \
-        'Network setting saved but NOT automatically applied. Use option 1 or run docker compose up -d --build from the project directory to apply it.' \
         'Switching to localhost leaves authentication and all accounts intact. External Compose invocations may allow shell variables to override .env.'
+    printf 'Apply now by rebuilding and recreating the ledger service? Type YES to apply, or press Enter / anything else to leave it saved [no]: '
+    IFS= read -r apply || apply=
+    if [ "$apply" != YES ]; then
+        printf '%s\n' 'Network setting saved but NOT automatically applied. To apply later, choose option 1 (install/build/start), select the desired port, and type REUSE if prompted. Restart (option 6) does not recreate the container.'
+        return 0
+    fi
+    apply_network "$requested_bind"
 }
 
 read_username() {
