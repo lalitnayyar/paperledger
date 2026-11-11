@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
-from app import auth, db, trading, yahoo_quotes
+from app import auth, db, stock_sim, trading, yahoo_quotes
 from app.llm import router as llm_router
 from app.market_data import router as market_data_router
 
@@ -72,6 +72,7 @@ app.add_middleware(StockImportBodyLimitMiddleware)
 app.include_router(llm_router)
 app.include_router(market_data_router)
 app.include_router(auth.router)
+app.include_router(stock_sim.router)
 
 
 @app.middleware("http")
@@ -95,6 +96,8 @@ async def local_origin_policy(request: Request, call_next):
 @app.exception_handler(RequestValidationError)
 async def validation_error(request: Request, exc: RequestValidationError):
     # Never echo raw inputs (NaN/Infinity also break JSON encoding and could leak secrets).
+    if request.url.path == "/api/market-data/finnhub":
+        return JSONResponse(status_code=422, content={"detail": "Provide a valid API key or request key removal."})
     if request.url.path == "/api/stock-import":
         # Unknown field names and validation locations may themselves contain user data.
         return JSONResponse(status_code=422, content={"detail": "Provide a CSV string within the import size limit."})
@@ -120,6 +123,8 @@ class SettingsUpdate(StrictModel):
     scan_interval_seconds: int | None = Field(default=None, ge=10, le=86400, strict=True)
     market_mode: Literal["crypto", "stocks", "both"] | None = None
     stock_symbols: list[str] | None = Field(default=None, min_length=1, max_length=25)
+    stock_provider: Literal["alpha_vantage", "finnhub"] | None = None
+    stock_source_mode: Literal["api", "csv", "both", "simulation"] | None = None
 
     @field_validator("stock_symbols", mode="before")
     @classmethod
@@ -222,7 +227,9 @@ def dashboard():
     data = trading.dashboard()
     data["disclosures"] = {
         "market_data": "DexScreener shows recently profiled tokens, not necessarily new pairs. Alpha Vantage GLOBAL_QUOTE is end-of-day historical data, not real-time: quote_date is its trading date, stock_volume_shares is shares, and stock_change_percent is close-to-close. Enter US-listed USD stocks only; the provider does not guarantee currency or verify US listing. With no key, the demo is available only for IBM. Manual scans reuse stock quotes for six hours and request only missing or expired symbols, subject to provider limits; stale cached quotes may be shown when refresh fails. Stock quotes are manual paper trades only and do not update marks. Check cache status, trading dates and original observation times.",
-        "manual_import": "Yahoo Finance imports are user-provided, not independently verified, and may be stale. The quote date is optional and user-supplied; the recorded import time is not the quote time. USD and US listing are assumed, not verified. Manual paper trading only: imports never trigger automatic buys or position marks.",
+        "finnhub": "Optional Finnhub quotes require a separate key and provider selection. Finnhub lists a free personal-use plan with 60 calls/minute and a global 30 calls/second cap; terms apply and limits may change. Other clients and processes share provider limits. Fetches are cached for five minutes, but the quote itself may be older or delayed: check quote_timestamp (UTC) and observed_at (fetch time). quote_date is the UTC calendar date, not necessarily a trading date. Volume and currency are not provided by this endpoint; USD and US listing are not verified. Stock quotes are manual paper trades only and do not update position marks. No live trading.",
+        "stock_sources": "Stock sources can be API, CSV, both, or simulation. In both mode, when a ticker occurs in both sources the selected API quote is displayed and the CSV row remains stored; select CSV mode to view it. Simulation data is synthetic, not market data. Source selection does not delete CSV imports.",
+        "manual_import": "CSV imports are user-provided, not independently verified, and may be stale. The quote date is optional and user-supplied; the recorded import time is not the quote time. USD and US listing are assumed, not verified. Manual paper trading only: imports never trigger automatic buys or position marks.",
         "risk": "Basic price, liquidity and volume checks do not detect scams, honeypots, rug pulls, or ensure safety.",
         "marks": "Unmarked positions make total equity and total unrealized P&L unavailable. Entry price includes allocated buy fees.",
         "orders": "Paper simulation only; no live orders. No automated stop-loss or take-profit execution; stop is a sizing assumption and take-profit is advisory.",

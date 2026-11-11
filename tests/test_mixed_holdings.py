@@ -314,7 +314,7 @@ def test_same_symbol_is_separate_by_asset_type_for_buys_marks_and_sells(client):
 
 def test_cached_watchlist_scans_and_imports_never_create_phantom_holdings(client):
     configure(client, "stocks")
-    ok(client.put("/api/settings", json={"stock_symbols": ["AAPL", "MSFT"]}))
+    ok(client.put("/api/settings", json={"stock_source_mode": "both", "stock_symbols": ["AAPL", "MSFT"]}))
     observed = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
     # Seed provider cache as data, not a mock of the scanner or accounting.
     with db.transaction() as conn:
@@ -335,13 +335,21 @@ def test_cached_watchlist_scans_and_imports_never_create_phantom_holdings(client
     data = ok(client.get("/api/dashboard"))
     held = positions(data)
     mark(client, held[("BTC", "crypto")], D("600"))
+    before_import = ok(client.get("/api/dashboard"))
+    before_held = positions(before_import)
     assert ok(client.post("/api/stock-import", json={"csv": "Symbol,Price\nAAPL,1234\nTSLA,50\n"}))["imported"] == 2
     cycle = ok(client.post("/api/cycle"))
     assert cycle["auto_paper"] is False and cycle["trades"] == []
+    assert [(c["symbol"], c["source"], c["price_usd"], c["cache_status"]) for c in cycle["candidates"]] == [
+        ("AAPL", "Alpha Vantage", 999, "cached"), ("MSFT", "Alpha Vantage", 33, "cached"),
+        ("AAPL", "User CSV import", 1234, "manual"), ("TSLA", "User CSV import", 50, "manual")]
     data = ok(client.get("/api/dashboard"))
     held = positions(data)
     assert set(held) == {("AAPL", "stock"), ("BTC", "crypto")}
     assert {c["symbol"] for c in data["candidates"]} == {"AAPL", "MSFT", "TSLA"}
+    assert data["candidates"] == cycle["candidates"]
+    assert held == before_held
+    assert data["trades"] == before_import["trades"] and data["summary"] == before_import["summary"]
     assert held[("AAPL", "stock")]["mark_price"] is None
     assert held[("AAPL", "stock")]["mark_source"] is None
     close(held[("BTC", "crypto")]["mark_price"], D("600"))
@@ -350,13 +358,17 @@ def test_cached_watchlist_scans_and_imports_never_create_phantom_holdings(client
     assert_summary(data, START - stock_basis - crypto_basis, None, None)
     assert len(data["trades"]) == 2
 
-    # Removing the stock from the watchlist removes its scanned candidate, not its holding.
+    # Removing the stock from the watchlist removes only its API candidate, not its CSV quote or holding.
     ok(client.put("/api/settings", json={"stock_symbols": ["MSFT"]}))
-    assert [(c["symbol"], c["cache_status"]) for c in ok(client.post("/api/scan"))["candidates"]] == [("MSFT", "cached")]
+    scan_after_removal = ok(client.post("/api/scan"))
+    assert [(c["symbol"], c["source"], c["price_usd"], c["cache_status"]) for c in scan_after_removal["candidates"]] == [
+        ("MSFT", "Alpha Vantage", 33, "cached"), ("AAPL", "User CSV import", 1234, "manual"),
+        ("TSLA", "User CSV import", 50, "manual")]
     after = ok(client.get("/api/dashboard"))
     assert positions(after) == held
     assert after["trades"] == data["trades"] and after["summary"] == data["summary"]
     assert any(c["symbol"] == "AAPL" and c["cache_status"] == "manual" for c in after["candidates"])
+    assert after["candidates"] == scan_after_removal["candidates"]
 
 
 def test_legacy_ledger_initialization_reads_and_updates_mixed_holdings(isolated_dir):

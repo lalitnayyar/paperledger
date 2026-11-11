@@ -84,7 +84,7 @@ def test_import_partial_invalid_optional_fields_and_log_redaction(client, feeds,
     assert items[0]["quote_date"] is None and items[0]["stock_volume_shares"] is None
     assert items[1]["quote_date"] == "2026-11-06" and items[1]["stock_volume_shares"] == 0
     for item in items:
-        assert item["asset_type"] == "stock" and item["source"] == "User import (Yahoo Finance)"
+        assert item["asset_type"] == "stock" and item["source"] == "User CSV import"
         assert item["risk_status"] == "manual only" and item["cache_status"] == "manual"
         assert all(item[k] is None for k in ("chain", "pair_address", "liquidity_usd", "volume_24h", "price_change_24h", "volume_spike_ratio", "pair_created_at", "stock_change_percent", "url"))
         assert db.parse_timestamp(item["observed_at"]) is not None
@@ -124,8 +124,8 @@ def test_replace_atomically_and_preserve_alpha_candidates_and_cache(client, feed
     assert client.post("/api/stock-import", json={"csv": "Symbol,Price\nIBM,999\nAAPL,20\n"}).json()["imported"] == 2
     items = client.get("/api/dashboard").json()["candidates"]
     assert [(c["symbol"], c["source"], c["price_usd"]) for c in items] == [
-        ("IBM", "Alpha Vantage", 87.5), ("IBM", "User import (Yahoo Finance)", 999),
-        ("AAPL", "User import (Yahoo Finance)", 20)]
+        ("IBM", "Alpha Vantage", 87.5), ("IBM", "User CSV import", 999),
+        ("AAPL", "User CSV import", 20)]
     with db.read_connection() as conn:
         before = [tuple(r) for r in conn.execute("SELECT * FROM stock_quote_cache")]
     assert client.post("/api/stock-import", json={"csv": "Symbol,Price\nMSFT,33\n"}).json()["imported"] == 1
@@ -154,26 +154,36 @@ def test_database_error_rolls_back_complete_replacement(client):
 
 
 def test_modes_scan_cycle_and_restart_do_not_trade_or_mark_imports(client, feeds):
-    client.put("/api/settings", json={"market_mode": "stocks", "auto_paper": True})
+    client.put("/api/settings", json={"market_mode": "stocks", "stock_source_mode": "both", "auto_paper": True})
     assert client.post("/api/trades", json={"symbol": "AAPL", "asset_type": "stock", "side": "BUY", "quantity": 1, "price": 10, "reason": "paper"}).status_code == 200
-    assert client.post("/api/stock-import", json={"csv": "Symbol,Price\nAAPL,99\nXYZ,5\n"}).status_code == 200
+    assert client.post("/api/stock-import", json={"csv": "Symbol,Price\nAAPL,99\nXYZ,5\nIBM,999\n"}).status_code == 200
     original = imported(client)
+    before = client.get("/api/dashboard").json()
     cycle = client.post("/api/cycle")
     assert cycle.status_code == 200 and cycle.json()["trades"] == []
-    assert [c["source"] for c in cycle.json()["candidates"]] == ["Alpha Vantage"]
+    assert cycle.json()["auto_paper"] is True
+    assert [(c["symbol"], c["source"], c["price_usd"]) for c in cycle.json()["candidates"]] == [
+        ("IBM", "Alpha Vantage", 87.5), ("AAPL", "User CSV import", 99),
+        ("XYZ", "User CSV import", 5), ("IBM", "User CSV import", 999)]
     data = client.get("/api/dashboard").json()
+    assert data["candidates"] == cycle.json()["candidates"]
+    assert data["positions"] == before["positions"] and data["trades"] == before["trades"]
+    assert data["summary"] == before["summary"]
     assert len(data["trades"]) == 1 and data["positions"][0]["mark_price"] is None
     assert data["positions"][0]["mark_source"] is None and data["positions"][0]["mark_timestamp"] is None
     assert imported(client) == original
     for item in original:
         with pytest.raises(trading.TradeError):
             trading.auto_buy({**item, "risk_status": "eligible"})
+    with pytest.raises(trading.TradeError):
+        trading.auto_buy({**cycle.json()["candidates"][0], "risk_status": "eligible"})
     # A crypto-only scan cannot erase imports or mark the stock position.
     client.put("/api/settings", json={"market_mode": "crypto"})
     assert imported(client) == []
     assert client.post("/api/scan").status_code == 200
     assert client.post("/api/cycle").status_code == 200
     assert client.get("/api/dashboard").json()["positions"][0]["mark_price"] is None
+    assert client.get("/api/dashboard").json()["positions"] == before["positions"]
     # Exercise the same SQLite initialization sequence a new process uses.
     db._initialized_paths.discard(str(db.data_path().absolute()))
     with TestClient(app) as restarted:
@@ -181,22 +191,72 @@ def test_modes_scan_cycle_and_restart_do_not_trade_or_mark_imports(client, feeds
         restarted.put("/api/settings", json={"market_mode": "both"})
         assert imported(restarted) == original
         assert restarted.get("/api/dashboard").json()["positions"][0]["mark_price"] is None
+        assert restarted.get("/api/dashboard").json()["positions"] == before["positions"]
         restarted.put("/api/settings", json={"market_mode": "stocks"})
         assert imported(restarted) == original
         assert len(restarted.get("/api/dashboard").json()["trades"]) == 1
     assert {r.url.host for r in feeds} == {"www.alphavantage.co", "api.dexscreener.com"}
 
 
-def test_failed_stock_scan_preserves_import_but_does_not_consider_it_a_feed(client, monkeypatch):
-    client.put("/api/settings", json={"market_mode": "stocks"})
-    client.post("/api/stock-import", json={"csv": "Symbol,Price\nAAPL,99\n"})
-    previous = imported(client)
+def test_both_mode_succeeds_with_saved_csv_and_warns_when_api_fails(client, monkeypatch):
+    assert client.put("/api/settings", json={"market_mode": "stocks", "stock_source_mode": "both", "auto_paper": True}).status_code == 200
+    for symbol, asset_type, price in [("AAPL", "stock", 10), ("BTC", "crypto", 50)]:
+        assert client.post("/api/trades", json={"symbol": symbol, "asset_type": asset_type, "side": "BUY",
+                           "quantity": 1, "price": price, "reason": "manual"}).status_code == 200
+    btc = next(p for p in client.get("/api/dashboard").json()["positions"] if p["symbol"] == "BTC")
+    assert client.patch(f"/api/positions/{btc['id']}/mark", json={"price": 60}).status_code == 200
+
     async def failed_feed(symbols):
         return [], ["Mock provider unavailable."]
+
     monkeypatch.setattr(trading, "_scan_stocks", failed_feed)
-    response = client.post("/api/scan")
-    assert response.status_code == 502
+    before_without_csv = client.get("/api/dashboard").json()
+    failed = client.post("/api/scan")
+    assert failed.status_code == 502 and "Mock provider unavailable." in failed.text
+    after_failed = client.get("/api/dashboard").json()
+    assert after_failed["positions"] == before_without_csv["positions"]
+    assert after_failed["trades"] == before_without_csv["trades"] and after_failed["summary"] == before_without_csv["summary"]
+
+    assert client.post("/api/stock-import", json={"csv": "Symbol,Price\nAAPL,99\n"}).json()["imported"] == 1
+    previous = imported(client)
+    before = client.get("/api/dashboard").json()
+    held = {(p["symbol"], p["asset_type"]): p for p in before["positions"]}
+    assert set(held) == {("AAPL", "stock"), ("BTC", "crypto")} and len(before["trades"]) == 2
+    assert held[("AAPL", "stock")]["quantity"] == 1 and held[("AAPL", "stock")]["mark_price"] is None
+    assert held[("AAPL", "stock")]["mark_source"] is None and held[("AAPL", "stock")]["mark_timestamp"] is None
+    assert held[("BTC", "crypto")]["quantity"] == 1 and held[("BTC", "crypto")]["mark_price"] == 60
+    assert held[("BTC", "crypto")]["mark_source"] == "manual" and held[("BTC", "crypto")]["mark_timestamp"]
+    with db.read_connection() as conn:
+        saved_csv = [tuple(row) for row in conn.execute("SELECT * FROM manual_stock_quotes")]
+
+    for endpoint in ("/api/scan", "/api/cycle"):
+        response = client.post(endpoint)
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["candidates"] == previous
+        assert [(c["symbol"], c["source"], c["price_usd"]) for c in result["candidates"]] == [
+            ("AAPL", "User CSV import", 99)]
+        assert "Mock provider unavailable." in result["warnings"]
+        assert any("API returned no quotes" in warning for warning in result["warnings"])
+        if endpoint == "/api/cycle":
+            assert result["auto_paper"] is True and result["trades"] == []
+        data = client.get("/api/dashboard").json()
+        assert data["positions"] == before["positions"]
+        assert data["trades"] == before["trades"] and data["summary"] == before["summary"]
+        assert data["candidates"] == previous
     assert imported(client) == previous
+    # Without CSV as an enabled source, the failed API still fails closed.
+    assert client.put("/api/settings", json={"stock_source_mode": "api"}).status_code == 200
+    response = client.post("/api/scan")
+    assert response.status_code == 502 and "Mock provider unavailable." in response.text
+    assert imported(client) == []
+    with db.read_connection() as conn:
+        assert [tuple(row) for row in conn.execute("SELECT * FROM manual_stock_quotes")] == saved_csv
+    assert client.put("/api/settings", json={"stock_source_mode": "both"}).status_code == 200
+    assert imported(client) == previous
+    after = client.get("/api/dashboard").json()
+    assert after["positions"] == before["positions"]
+    assert after["trades"] == before["trades"] and after["summary"] == before["summary"]
 
 
 def test_25_unique_watchlist_and_import_accepted_26_rejected(client):

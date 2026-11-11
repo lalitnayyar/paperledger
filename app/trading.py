@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from typing import Any
@@ -19,12 +21,37 @@ STOCK_SYMBOL_RE = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z]{1,4})?$")
 ADDRESS_RE = re.compile(r"^[A-Za-z0-9:_-]{1,160}$")
 _scan_lock = asyncio.Lock()
 STOCK_CACHE_TTL = timedelta(hours=6)
+FINNHUB_CACHE_TTL = timedelta(minutes=5)
+_finnhub_spacing_lock = threading.Lock()
+_finnhub_next_request = 0.0
 
 
 def _stock_cache_is_fresh(observed_at: Any, now: datetime | None = None) -> bool:
     observed = db.parse_timestamp(observed_at)
     now = now or datetime.now(timezone.utc)
     return observed is not None and timedelta(0) <= now - observed < STOCK_CACHE_TTL
+
+
+def _finnhub_cache_is_fresh(observed_at: Any, now: datetime | None = None) -> bool:
+    fetched = db.parse_timestamp(observed_at)
+    now = now or datetime.now(timezone.utc)
+    return fetched is not None and timedelta(0) <= now - fetched < FINNHUB_CACHE_TTL
+
+
+def _finnhub_quote_is_old(timestamp: Any, now: datetime | None = None) -> bool:
+    quote_time = db.parse_timestamp(timestamp)
+    now = now or datetime.now(timezone.utc)
+    return quote_time is None or now - quote_time >= FINNHUB_CACHE_TTL or quote_time > now
+
+
+def _finnhub_reason(timestamp: Any) -> str:
+    reason = ("Finnhub quote for manual paper trades only; may be delayed or incomplete. "
+              "No volume is provided, and currency and US listing are not verified. "
+              "No liquidity or risk assessment and no automatic buy or position mark. "
+              "Check quote_timestamp (UTC) separately from observed_at (fetch time).")
+    if _finnhub_quote_is_old(timestamp):
+        reason += " Warning: the provider quote timestamp is old (or in the future); the price is not current."
+    return reason
 
 
 def token_key(chain: str, address: str) -> tuple[str, str]:
@@ -87,6 +114,20 @@ def portfolio(conn) -> dict[str, Any]:
         return {"positions": positions, "summary": summary}
 
 
+def _manual_stock_candidates(conn) -> list[dict]:
+    return [{
+        "symbol": row["symbol"], "chain": None, "pair_address": None,
+        "price_usd": _f(row["price_usd"]), "liquidity_usd": None, "volume_24h": None,
+        "price_change_24h": None, "volume_spike_ratio": None, "pair_created_at": None,
+        "risk_status": "manual only",
+        "reason": "User-provided CSV import, not independently verified; US listing and USD are assumed. Quote date is optional and user-supplied; the import time is not the quote time. Price and volume may be stale or incomplete. Manual paper trading only; no automatic buy, position mark, liquidity check, or risk assessment.",
+        "url": None, "observed_at": row["observed_at"], "asset_type": "stock",
+        "source": "User CSV import", "quote_date": row["quote_date"],
+        "stock_volume_shares": row["stock_volume_shares"], "stock_change_percent": None,
+        "cache_status": "manual",
+    } for row in conn.execute("SELECT symbol,price_usd,quote_date,stock_volume_shares,observed_at FROM manual_stock_quotes ORDER BY rowid")]
+
+
 def dashboard() -> dict[str, Any]:
     with db.read_connection() as conn:
         result = portfolio(conn)
@@ -94,33 +135,37 @@ def dashboard() -> dict[str, Any]:
         result["agents"] = [dict(row) for row in conn.execute("SELECT id,name,status,detail FROM agents ORDER BY rowid")]
         result["candidates"] = []
         mode = result["settings"]["market_mode"]
-        for row in conn.execute("SELECT symbol,chain,pair_address,price_usd,liquidity_usd,volume_24h,price_change_24h,volume_spike_ratio,pair_created_at,risk_status,reason,url,observed_at,asset_type,source,quote_date,stock_volume_shares,stock_change_percent,cache_status FROM candidates WHERE (?='both' OR asset_type=?) ORDER BY id", (mode, "stock" if mode == "stocks" else "crypto")):
+        for row in conn.execute("SELECT symbol,chain,pair_address,price_usd,liquidity_usd,volume_24h,price_change_24h,volume_spike_ratio,pair_created_at,risk_status,reason,url,observed_at,asset_type,source,quote_date,stock_volume_shares,stock_change_percent,cache_status,quote_timestamp FROM candidates WHERE (?='both' OR asset_type=?) ORDER BY id", (mode, "stock" if mode == "stocks" else "crypto")):
             item = dict(row)
             if item["asset_type"] == "stock":
                 if item["symbol"] not in result["settings"]["stock_symbols"]:
                     continue
+                source_mode = result["settings"]["stock_source_mode"]
+                expected_source = ("Simulation" if source_mode == "simulation" else
+                    {"alpha_vantage": "Alpha Vantage", "finnhub": "Finnhub"}.get(result["settings"]["stock_provider"]) if source_mode in ("api", "both") else None)
+                if item["source"] != expected_source:
+                    continue
                 item["chain"] = item["pair_address"] = None
-                item["cache_status"] = (item["cache_status"] if item["cache_status"] in ("fresh", "cached") else "cached") if _stock_cache_is_fresh(item["observed_at"]) else "stale"
+                if item["source"] == "Simulation":
+                    item["cache_status"] = "simulated"
+                else:
+                    fresh = _finnhub_cache_is_fresh(item["observed_at"]) if item["source"] == "Finnhub" else _stock_cache_is_fresh(item["observed_at"])
+                    item["cache_status"] = (item["cache_status"] if item["cache_status"] in ("fresh", "cached") else "cached") if fresh else "stale"
+                if item["source"] == "Finnhub":
+                    item["reason"] = _finnhub_reason(item["quote_timestamp"])
             else:
                 item["cache_status"] = None
+            if item["source"] not in ("Finnhub", "Simulation"):
+                item.pop("quote_timestamp")
             for k in ("price_usd", "liquidity_usd", "volume_24h", "price_change_24h", "volume_spike_ratio", "stock_change_percent"):
                 item[k] = _f(item[k])
             result["candidates"].append(item)
-        if mode in ("stocks", "both"):
+        if mode in ("stocks", "both") and result["settings"]["stock_source_mode"] in ("csv", "both"):
             # Manual imports are separate from scanned candidates and provider cache;
             # never feed them to the scanner, automatic orders, or position marks.
-            for row in conn.execute("SELECT symbol,price_usd,quote_date,stock_volume_shares,observed_at FROM manual_stock_quotes ORDER BY rowid"):
-                result["candidates"].append({
-                    "symbol": row["symbol"], "chain": None, "pair_address": None,
-                    "price_usd": _f(row["price_usd"]), "liquidity_usd": None, "volume_24h": None,
-                    "price_change_24h": None, "volume_spike_ratio": None, "pair_created_at": None,
-                    "risk_status": "manual only",
-                    "reason": "User-provided Yahoo Finance import, not independently verified; US listing and USD are assumed. Quote date is optional and user-supplied; the import time is not the quote time. Price and volume may be stale or incomplete. Manual paper trading only; no automatic buy, position mark, liquidity check, or risk assessment.",
-                    "url": None, "observed_at": row["observed_at"], "asset_type": "stock",
-                    "source": "User import (Yahoo Finance)", "quote_date": row["quote_date"],
-                    "stock_volume_shares": row["stock_volume_shares"], "stock_change_percent": None,
-                    "cache_status": "manual",
-                })
+            # Keep both sources, even when they quote the same ticker: they may
+            # have different values and times and are not interchangeable.
+            result["candidates"].extend(_manual_stock_candidates(conn))
         result["trades"] = []
         for row in conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 250"):
             item = dict(row)
@@ -514,6 +559,146 @@ async def _scan_stocks(symbols: list[str]) -> tuple[list[dict], list[str]]:
     return candidates, warnings
 
 
+def _finnhub_candidate(payload: Any, symbol: str, observed: str) -> dict | None:
+    if (not isinstance(payload, dict) or "error" in payload or not STOCK_SYMBOL_RE.fullmatch(symbol)
+            or db.parse_timestamp(observed) is None):
+        return None
+    price = safe_number(payload.get("c"), positive=True)
+    seconds = safe_number(payload.get("t"), positive=True)
+    if price is None or seconds is None or seconds != seconds.to_integral_value():
+        return None
+    try:
+        stamp = datetime.fromtimestamp(int(seconds), timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    timestamp = stamp.isoformat().replace("+00:00", "Z")
+    change = safe_number(payload.get("dp"))
+    return {"symbol": symbol, "chain": None, "pair_address": None, "price_usd": str(price),
+            "liquidity_usd": None, "volume_24h": None, "price_change_24h": None,
+            "volume_spike_ratio": None, "pair_created_at": None, "risk_status": "manual only",
+            "reason": _finnhub_reason(timestamp), "url": None, "observed_at": observed,
+            "asset_type": "stock", "source": "Finnhub", "quote_date": stamp.date().isoformat(),
+            "quote_timestamp": timestamp, "stock_volume_shares": None,
+            "stock_change_percent": str(change) if change is not None else None, "cache_status": "fresh"}
+
+
+def _cached_finnhub_candidate(row: Any) -> dict | None:
+    timestamp = db.parse_timestamp(row["quote_timestamp"])
+    if timestamp is None or timestamp.microsecond:
+        return None
+    try:
+        item = _finnhub_candidate({"c": row["price_usd"], "dp": row["stock_change_percent"],
+                                   "t": int(timestamp.timestamp())}, row["symbol"], row["observed_at"])
+    except (OverflowError, OSError, ValueError):
+        return None
+    if item is None or item["quote_date"] != row["quote_date"] or row["stock_volume_shares"] is not None:
+        return None
+    if row["stock_change_percent"] is not None and item["stock_change_percent"] is None:
+        return None
+    # Preserve the stored provider timestamp exactly, independently of fetch time.
+    item["quote_timestamp"] = row["quote_timestamp"]
+    return item
+
+
+async def _wait_finnhub_spacing(deadline: float) -> bool:
+    # Reservations serialize start times within this process, including separate scans.
+    # Other processes/clients using the same provider account are outside this guard.
+    global _finnhub_next_request
+    with _finnhub_spacing_lock:
+        now = time.monotonic()
+        reserved = max(now, _finnhub_next_request)
+        if reserved >= deadline:
+            return False
+        _finnhub_next_request = reserved + 0.05
+    delay = reserved - time.monotonic()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    return time.monotonic() < deadline
+
+
+async def _scan_finnhub(symbols: list[str]) -> tuple[list[dict], list[str]]:
+    # The settings API already validates this, but bound internal callers as well.
+    symbols = [s for s in symbols[:25] if isinstance(s, str) and STOCK_SYMBOL_RE.fullmatch(s)]
+    warnings, results, cache = [], {}, {}
+    with db.read_connection() as conn:
+        for symbol, row in db.get_stock_quote_cache(conn, provider=db.FINNHUB_QUOTE_CACHE, symbols=symbols).items():
+            item = _cached_finnhub_candidate(row)
+            if item:
+                cache[symbol] = item
+    now = datetime.now(timezone.utc)
+    pending = []
+    for symbol in symbols:
+        item = cache.get(symbol)
+        if item and _finnhub_cache_is_fresh(item["observed_at"], now):
+            results[symbol] = {**item, "cache_status": "cached"}
+        else:
+            pending.append(symbol)
+    if pending:
+        try:
+            key = market_data.load_finnhub_key()
+        except HTTPException:
+            key = None
+            warnings.append("Finnhub key is unavailable or cannot be decrypted; check encryption configuration.")
+        if key is None:
+            warnings.append("Finnhub requires its own saved API key; no Finnhub requests were made.")
+            warnings.extend(f"{symbol}: skipped because the Finnhub key is unavailable." for symbol in pending)
+        else:
+            deadline = time.monotonic() + 30
+            async with httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False,
+                    headers={"Accept": "application/json", "User-Agent": "LocalPaperLedger/1.0", "X-Finnhub-Token": key}) as client:
+                for index, symbol in enumerate(pending):
+                    if not await _wait_finnhub_spacing(deadline):
+                        warnings.extend(f"{s}: skipped after Finnhub scan time limit." for s in pending[index:])
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        warnings.extend(f"{s}: skipped after Finnhub scan time limit." for s in pending[index:])
+                        break
+                    stop = False
+                    try:
+                        with market_data.private_finnhub_request():
+                            response = await asyncio.wait_for(client.get("https://finnhub.io/api/v1/quote", params={"symbol": symbol}), timeout=remaining)
+                        status = response.status_code
+                        if status == 429:
+                            warnings.append(f"{symbol}: Finnhub returned HTTP 429 (rate limit). Retry manually when access is available; no reset time is assumed.")
+                            stop = True
+                        elif status in (401, 403):
+                            warnings.append(f"{symbol}: Finnhub refused the request (HTTP {status}); check the key and provider account access.")
+                            stop = True
+                        elif not 200 <= status < 300:
+                            warnings.append(f"{symbol}: Finnhub returned HTTP {status}.")
+                            stop = 300 <= status < 400
+                        else:
+                            item = _finnhub_candidate(response.json(), symbol, db.utc_now())
+                            if item is None:
+                                warnings.append(f"{symbol}: Finnhub returned an empty or invalid quote or quote timestamp.")
+                            else:
+                                results[symbol] = item
+                    except (asyncio.TimeoutError, httpx.TimeoutException):
+                        warnings.append(f"{symbol}: Finnhub request timed out.")
+                    except Exception:
+                        # No upstream bodies, exception details, request URLs or credentials.
+                        warnings.append(f"{symbol}: Finnhub request failed or returned invalid data.")
+                    if stop:
+                        warnings.extend(f"{s}: skipped after Finnhub provider response to avoid further requests." for s in pending[index + 1:])
+                        break
+    for symbol in symbols:
+        if symbol not in results and symbol in cache:
+            results[symbol] = {**cache[symbol], "cache_status": "stale"}
+            warnings.append(f"{symbol}: showing a stale cached Finnhub quote; original fetch and quote timestamps are retained.")
+        elif symbol in results and results[symbol]["cache_status"] == "cached" and not _finnhub_cache_is_fresh(results[symbol]["observed_at"]):
+            results[symbol]["cache_status"] = "stale"
+            warnings.append(f"{symbol}: the Finnhub cache expired during this scan; original timestamps are retained.")
+        if symbol in results:
+            results[symbol]["reason"] = _finnhub_reason(results[symbol]["quote_timestamp"])
+            if _finnhub_quote_is_old(results[symbol]["quote_timestamp"]):
+                warnings.append(f"{symbol}: Finnhub's quote timestamp is old or in the future; this price is not current even if just fetched.")
+    candidates = [results[symbol] for symbol in symbols if symbol in results]
+    if candidates and not any(item["cache_status"] == "fresh" for item in candidates):
+        warnings.append("Only cached Finnhub quotes are available; no new Finnhub quotes were fetched in this scan.")
+    return candidates, warnings
+
+
 _CANDIDATE_FIELDS = ("symbol", "chain", "pair_address", "price_usd", "liquidity_usd", "volume_24h",
     "price_change_24h", "volume_spike_ratio", "pair_created_at", "risk_status", "reason", "url",
     "observed_at", "asset_type", "source", "quote_date", "stock_volume_shares", "stock_change_percent", "cache_status")
@@ -525,6 +710,8 @@ async def scan_market() -> dict[str, Any]:
         with db.read_connection() as conn:
             settings = db.get_settings(conn)
         mode = settings["market_mode"]
+        source_mode = settings["stock_source_mode"]
+        provider = settings["stock_provider"]
         candidates, warnings, profiles_scanned = [], [], 0
         successful_sources = 0
         if mode in ("crypto", "both"):
@@ -535,46 +722,85 @@ async def scan_market() -> dict[str, Any]:
             except (httpx.HTTPError, OSError, ValueError, TypeError, ScanError):
                 warnings.append("DexScreener scan failed; no crypto candidates from this scan.")
         if mode in ("stocks", "both"):
-            stocks, stock_warnings = await _scan_stocks(settings["stock_symbols"])
-            candidates.extend(stocks)
-            warnings.extend(stock_warnings)
-            if stocks:
-                successful_sources += 1
+            if source_mode in ("api", "both"):
+                if provider == "alpha_vantage":
+                    stocks, stock_warnings = await _scan_stocks(settings["stock_symbols"])
+                elif provider == "finnhub":
+                    stocks, stock_warnings = await _scan_finnhub(settings["stock_symbols"])
+                else:
+                    stocks, stock_warnings = [], ["Unrecognized stock provider; no stock API request was made."]
+                candidates.extend(stocks)
+                warnings.extend(stock_warnings)
+                if stocks:
+                    successful_sources += 1
+                elif source_mode == "both":
+                    warnings.append("Selected stock API returned no quotes; any saved CSV imports remain available separately.")
+            elif source_mode == "simulation":
+                from app import stock_sim
+                stocks = stock_sim.make_candidates(settings["stock_symbols"], stock_sim.current_step(), db.utc_now())
+                # Synthetic output is never tradable or eligible for the provider cache.
+                stocks = [{**item, "source": "Simulation", "asset_type": "stock", "risk_status": "simulated",
+                           "cache_status": "simulated", "quote_timestamp": None} for item in stocks]
+                candidates.extend(stocks)
+                warnings.append("Simulation uses synthetic stock data only; it is not a market quote and does not trade or mark real ledger positions.")
+                if stocks:
+                    successful_sources += 1
+            elif source_mode != "csv":
+                warnings.append("Unrecognized stock source mode; no stock source was queried.")
         observed = db.utc_now()
-        if not successful_sources:
-            detail = "All requested market sources failed; previously saved candidates may be stale. " + " ".join(warnings)
-            with db.transaction() as conn:
-                db.set_agent(conn, "scanner", "error", detail)
-                db.log(conn, "scanner", detail, "error")
-            raise ScanError(detail)
+        changed = False
+        failed = False
+        manual_candidates = []
         with db.transaction() as conn:
             current = db.get_settings(conn)
-            changed = current["market_mode"] != mode or (mode in ("stocks", "both") and current["stock_symbols"] != settings["stock_symbols"])
+            changed = (current["market_mode"] != mode or current["stock_symbols"] != settings["stock_symbols"]
+                       or current["stock_provider"] != provider or current["stock_source_mode"] != source_mode)
             if changed:
                 detail = "Market settings changed during scan; no candidates were saved or traded. Scan again."
                 db.set_agent(conn, "scanner", "error", detail)
                 db.log(conn, "scanner", detail, "error")
             else:
-                conn.execute("DELETE FROM candidates")
-                for item in candidates:
-                    if item["asset_type"] == "stock" and item["cache_status"] == "fresh":
-                        db.put_stock_quote_cache(conn, provider=db.ALPHA_VANTAGE_QUOTE_CACHE, item=item)
-                    # Legacy chain/pair columns are NOT NULL. Empty storage values are
-                    # represented as null in the API for stock rows.
-                    values = [item[k] if k not in ("chain", "pair_address") else item[k] or "" for k in _CANDIDATE_FIELDS]
-                    conn.execute("INSERT INTO candidates(" + ",".join(_CANDIDATE_FIELDS) + ") VALUES (" + ",".join("?" for _ in _CANDIDATE_FIELDS) + ")", values)
-                    if item["asset_type"] == "crypto" and item["price_usd"] is not None:
-                        conn.execute("UPDATE positions SET mark_price=?,mark_source='dexscreener',mark_timestamp=? WHERE asset_type='crypto' AND chain=? AND pair_address=?", (item["price_usd"], item["observed_at"], item["chain"], item["pair_address"]))
-                db.snapshot(conn)
-                eligible = sum(c["risk_status"] == "eligible" for c in candidates)
-                detail = f"Market scan ({mode}): {profiles_scanned} crypto profiles, {len(candidates)} candidates, {eligible} eligible for crypto paper cycles; {len(warnings)} warning(s)."
-                db.set_agent(conn, "scanner", "warning" if warnings else "ready", detail)
-                db.set_agent(conn, "rug_check", "ready", "Crypto liquidity/volume checks only; cannot identify scams, honeypots or rug pulls. Stocks are manual only.")
-                db.log(conn, "scanner", detail, "warning" if warnings else "info")
-        if changed:
+                if mode in ("stocks", "both") and source_mode in ("csv", "both"):
+                    manual_candidates = _manual_stock_candidates(conn)
+                    if manual_candidates:
+                        successful_sources += 1
+                    elif source_mode == "csv":
+                        warnings.append("No saved CSV stock quotes are available; import a CSV first.")
+                if not successful_sources:
+                    failed = True
+                    detail = "All requested market sources failed; previously saved candidates may be stale. " + " ".join(warnings)
+                    db.set_agent(conn, "scanner", "error", detail)
+                    db.log(conn, "scanner", detail, "error")
+                else:
+                    snapshot = (mode == "crypto" or source_mode in ("api", "both")
+                                or any(item["asset_type"] == "crypto" for item in candidates))
+                    _save_scan_results(conn, candidates, warnings, mode, profiles_scanned, snapshot)
+        if changed or failed:
             raise ScanError(detail)
+        candidates.extend(manual_candidates)
         return {"observed_at": observed, "profiles_scanned": profiles_scanned, "market_mode": mode,
                 "warnings": warnings, "candidates": [{**c, **{k: _f(c[k]) for k in _DECIMAL_CANDIDATE_FIELDS}} for c in candidates]}
+
+
+def _save_scan_results(conn, candidates, warnings, mode, profiles_scanned, snapshot):
+    conn.execute("DELETE FROM candidates")
+    for item in candidates:
+        if item["asset_type"] == "stock" and item["cache_status"] == "fresh" and item["source"] in ("Alpha Vantage", "Finnhub"):
+            namespace = db.FINNHUB_QUOTE_CACHE if item["source"] == "Finnhub" else db.ALPHA_VANTAGE_QUOTE_CACHE
+            db.put_stock_quote_cache(conn, provider=namespace, item=item)
+        # Legacy chain/pair columns are NOT NULL. Empty storage values are
+        # represented as null in the API for stock rows.
+        values = [item[k] if k not in ("chain", "pair_address") else item[k] or "" for k in _CANDIDATE_FIELDS]
+        conn.execute("INSERT INTO candidates(" + ",".join(_CANDIDATE_FIELDS) + ",quote_timestamp) VALUES (" + ",".join("?" for _ in _CANDIDATE_FIELDS) + ",?)", values + [item.get("quote_timestamp")])
+        if item["asset_type"] == "crypto" and item["price_usd"] is not None:
+            conn.execute("UPDATE positions SET mark_price=?,mark_source='dexscreener',mark_timestamp=? WHERE asset_type='crypto' AND chain=? AND pair_address=?", (item["price_usd"], item["observed_at"], item["chain"], item["pair_address"]))
+    if snapshot:
+        db.snapshot(conn)
+    eligible = sum(c["risk_status"] == "eligible" for c in candidates)
+    detail = f"Market scan ({mode}): {profiles_scanned} crypto profiles, {len(candidates)} candidates, {eligible} eligible for crypto paper cycles; {len(warnings)} warning(s)."
+    db.set_agent(conn, "scanner", "warning" if warnings else "ready", detail)
+    db.set_agent(conn, "rug_check", "ready", "Crypto liquidity/volume checks only; cannot identify scams, honeypots or rug pulls. Stocks are manual only.")
+    db.log(conn, "scanner", detail, "warning" if warnings else "info")
 
 
 def auto_buy(candidate: dict[str, Any]) -> dict[str, Any]:

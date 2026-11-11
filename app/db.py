@@ -26,6 +26,8 @@ DEFAULT_SETTINGS = {
     "scan_interval_seconds": 300,
     "market_mode": "crypto",
     "stock_symbols": ["IBM"],
+    "stock_provider": "alpha_vantage",
+    "stock_source_mode": "both",
 }
 
 AGENTS = {
@@ -79,6 +81,7 @@ CREATE TABLE IF NOT EXISTS agents (
 _init_lock = threading.Lock()
 _initialized_paths: set[str] = set()
 ALPHA_VANTAGE_QUOTE_CACHE = "alpha_vantage:global_quote"
+FINNHUB_QUOTE_CACHE = "finnhub:quote"
 
 
 def utc_now() -> str:
@@ -128,6 +131,7 @@ def init_db() -> None:
             "source": "TEXT NOT NULL DEFAULT 'DexScreener'",
             "quote_date": "TEXT", "stock_volume_shares": "INTEGER",
             "stock_change_percent": "TEXT", "cache_status": "TEXT",
+            "quote_timestamp": "TEXT",
         }
         for name, column_type in migrations.items():
             if name not in candidate_columns:
@@ -141,9 +145,14 @@ def init_db() -> None:
             stock_volume_shares INTEGER, stock_change_percent TEXT, observed_at TEXT NOT NULL,
             PRIMARY KEY(provider, symbol)
         )""")
+        cache_columns = {row[1] for row in conn.execute("PRAGMA table_info(stock_quote_cache)")}
+        if "quote_timestamp" not in cache_columns:
+            conn.execute("ALTER TABLE stock_quote_cache ADD COLUMN quote_timestamp TEXT")
         if old_cache:
-            conn.execute("""INSERT INTO stock_quote_cache(provider,symbol,price_usd,quote_date,stock_volume_shares,stock_change_percent,observed_at)
-                SELECT ?,symbol,price_usd,quote_date,stock_volume_shares,stock_change_percent,observed_at FROM stock_quote_cache_legacy""",
+            legacy_columns = {row[1] for row in conn.execute("PRAGMA table_info(stock_quote_cache_legacy)")}
+            legacy_timestamp = "quote_timestamp" if "quote_timestamp" in legacy_columns else "NULL"
+            conn.execute(f"""INSERT INTO stock_quote_cache(provider,symbol,price_usd,quote_date,stock_volume_shares,stock_change_percent,observed_at,quote_timestamp)
+                SELECT ?,symbol,price_usd,quote_date,stock_volume_shares,stock_change_percent,observed_at,{legacy_timestamp} FROM stock_quote_cache_legacy""",
                 (ALPHA_VANTAGE_QUOTE_CACHE,))
             conn.execute("DROP TABLE stock_quote_cache_legacy")
         created = conn.execute("INSERT OR IGNORE INTO settings(id, data) VALUES (1, ?)", (json.dumps(DEFAULT_SETTINGS),)).rowcount
@@ -166,7 +175,7 @@ def init_db() -> None:
                         or not valid_number(volume) or volume < 0 or volume != volume.to_integral_value()
                         or (change is not None and not valid_number(change))):
                         continue
-                    conn.execute("INSERT OR IGNORE INTO stock_quote_cache VALUES (?,?,?,?,?,?,?)",
+                    conn.execute("INSERT OR IGNORE INTO stock_quote_cache(provider,symbol,price_usd,quote_date,stock_volume_shares,stock_change_percent,observed_at) VALUES (?,?,?,?,?,?,?)",
                                  (ALPHA_VANTAGE_QUOTE_CACHE, symbol, str(price), day, int(volume), str(change) if change is not None else None, row["observed_at"]))
                 except (ValueError, TypeError, InvalidOperation, OverflowError):
                     continue
@@ -255,13 +264,13 @@ def get_stock_quote_cache(conn: sqlite3.Connection, *, provider: str, symbols: l
 
 def put_stock_quote_cache(conn: sqlite3.Connection, *, provider: str, item: dict[str, Any]) -> None:
     """Upsert a validated quote in an explicit namespace, within the caller's transaction."""
-    conn.execute("""INSERT INTO stock_quote_cache(provider,symbol,price_usd,quote_date,stock_volume_shares,stock_change_percent,observed_at)
-        VALUES (?,?,?,?,?,?,?) ON CONFLICT(provider,symbol) DO UPDATE SET
+    conn.execute("""INSERT INTO stock_quote_cache(provider,symbol,price_usd,quote_date,stock_volume_shares,stock_change_percent,observed_at,quote_timestamp)
+        VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(provider,symbol) DO UPDATE SET
         price_usd=excluded.price_usd,quote_date=excluded.quote_date,
         stock_volume_shares=excluded.stock_volume_shares,stock_change_percent=excluded.stock_change_percent,
-        observed_at=excluded.observed_at""",
+        observed_at=excluded.observed_at,quote_timestamp=excluded.quote_timestamp""",
         (provider, item["symbol"], item["price_usd"], item.get("quote_date"), item.get("stock_volume_shares"),
-         item.get("stock_change_percent"), item["observed_at"]))
+         item.get("stock_change_percent"), item["observed_at"], item.get("quote_timestamp")))
 
 
 def set_agent(conn: sqlite3.Connection, agent_id: str, status: str, detail: str) -> None:

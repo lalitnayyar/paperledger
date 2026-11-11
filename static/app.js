@@ -2,7 +2,7 @@
   'use strict';
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
-  const state = { dashboard: null, llm: null, providerId: '', marketData: null, marketDirty: false, marketSaving: false, watchlistDirty: false, watchlistSaving: false, importSaving: false, scanRunning: false, scanWarnings: [], holdingsFilter: 'all' };
+  const state = { dashboard: null, llm: null, providerId: '', marketData: null, finnhubData: null, finnhubUnavailable: true, marketDirty: false, marketSaving: false, stockSourceDirty: false, stockSourceSaving: false, keySaving: false, watchlistDirty: false, watchlistSaving: false, importSaving: false, scanRunning: false, scanWarnings: [], holdingsFilter: 'all', simulation: null, simulationLoading: false, simulationRunning: false, simulationUnavailable: false };
   const markDrafts = new Map();
   const markPending = new Set();
   let session = null;
@@ -11,7 +11,7 @@
     if (authLost) return;
     authLost = true;
     session = null;
-    state.dashboard = null; state.llm = null; state.marketData = null;
+    state.dashboard = null; state.llm = null; state.marketData = null; state.finnhubData = null; state.simulation = null;
     $('.app-shell').hidden = true;
     $('#session-loading').hidden = false;
     $('#session-loading').textContent = 'Your session has ended. Redirecting to sign in…';
@@ -42,10 +42,22 @@
   const number = value => present(value) ? new Intl.NumberFormat('en-US', {maximumFractionDigits:18}).format(Number(value)) : '—';
   const date = value => { if (!value) return '—'; const d = new Date(value); return Number.isNaN(d.valueOf()) ? String(value) : d.toLocaleString(undefined, {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}); };
   const shortDate = value => { if (!value) return '—'; const d = new Date(value); return Number.isNaN(d.valueOf()) ? String(value) : d.toLocaleDateString(undefined, {month:'short',day:'numeric',year:'numeric'}); };
+  const isSimulation = item => item?.cache_status === 'simulated' || /^simulation$/i.test(String(item?.source || '').trim());
+  const isFinnhub = item => /^finnhub\b/i.test(String(item?.source || '').trim());
+  function stockQuoteTime(item) {
+    if (isSimulation(item)) return 'Synthetic quote · not market data';
+    if (isFinnhub(item)) {
+      const raw = typeof item.quote_timestamp === 'string' ? item.quote_timestamp : '';
+      const parsed = /(?:Z|[+-]\d{2}:\d{2})$/i.test(raw) ? new Date(raw) : new Date(NaN);
+      return `Provider timestamp (UTC): ${Number.isNaN(parsed.valueOf()) ? 'Unavailable' : parsed.toISOString()}`;
+    }
+    return `${item.cache_status === 'manual' ? 'User-supplied date' : 'Trading day'}: ${item.quote_date || 'Unavailable'}`;
+  }
   function stockQuoteStatus(item) {
+    if (isSimulation(item)) return 'Synthetic values only · not market data';
     const observed = item.observed_at ? String(item.observed_at) : '';
     if (item.cache_status === 'manual') return `Manual import · ${observed ? `imported at ${observed}` : 'import time unavailable'} · not independently verified`;
-    const label = item.cache_status === 'fresh' ? 'Fresh' : item.cache_status === 'cached' ? 'Cached' : item.cache_status === 'stale' ? 'Stale cached quote' : 'Cache status unavailable';
+    const label = item.cache_status === 'fresh' ? (isFinnhub(item) ? 'Newly fetched' : 'Fresh') : item.cache_status === 'cached' ? 'Cached' : item.cache_status === 'stale' ? 'Stale cached quote (not refreshed)' : 'Cache status unavailable';
     return `${label} · ${observed ? `fetched at ${observed}` : 'fetch time unavailable'}`;
   }
   function notice(message, error = false, warning = false) { const el = $('#notice'); el.textContent = message; el.classList.toggle('error', error); el.classList.toggle('warning', warning); el.hidden = !message; }
@@ -66,8 +78,10 @@
     if (raw) { try { data = JSON.parse(raw); } catch (_) { if (!response.ok) throw new Error(`Request failed (${response.status}).`); throw new Error('The server returned an invalid response.'); } }
     if (!response.ok) {
       const detail = data.detail ?? data.error ?? data.message;
-      const scannerRequest = /^\/api\/(?:scan|cycle)(?:\?|$)/.test(path);
-      const message = typeof detail === 'string' ? (scannerRequest ? safeScannerMessage(detail) : detail) : `Request failed (${response.status}).`;
+      const scannerRequest = /^\/api\/(?:scan|cycle|simulation\/stocks\/cycle)(?:\?|$)/.test(path);
+      const keyRequest = /^\/api\/market-data(?:\/finnhub)?(?:\?|$)/.test(path);
+      // Key endpoints can echo credentials in errors; never display their payloads.
+      const message = keyRequest ? `Stock key request failed (${response.status}). Verify permissions and try again.` : typeof detail === 'string' ? (scannerRequest ? safeScannerMessage(detail) : detail) : `Request failed (${response.status}).`;
       const error = new Error(message); error.status = response.status; throw error;
     }
     return data;
@@ -113,18 +127,18 @@
     items = Array.isArray(items) ? items : []; $('#candidates-empty').hidden = items.length > 0;
     const displayOrder = items.map((item, index) => ({item, index})).sort((a, b) => Number(b.item.asset_type === 'stock') - Number(a.item.asset_type === 'stock'));
     $('#candidates-body').innerHTML = displayOrder.map(({item, index}) => {
-      const stock = item.asset_type === 'stock';
+      const stock = item.asset_type === 'stock', simulated = stock && isSimulation(item);
       const url = safeUrl(item.url), symbol = escapeHtml(item.symbol || '—');
       const source = escapeHtml(item.source || (stock ? 'Source unavailable' : 'DexScreener'));
       const asset = `${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"><strong>${symbol} ↗</strong></a>` : `<strong>${symbol}</strong>`}<small>${stock ? 'STOCK' : 'CRYPTO'} · Source: ${source}</small>${!stock ? `<small title="${escapeHtml(item.pair_address || '')}">${escapeHtml(item.chain || '—')}${item.pair_address ? ` · ${escapeHtml(item.pair_address)}` : ''}</small>` : ''}`;
-      const quote = stock ? `<small class="quote-meta">${item.cache_status === 'manual' ? 'User-supplied date' : 'Trading day'}: ${escapeHtml(item.quote_date || 'Unavailable')}</small><small class="quote-meta ${item.cache_status === 'stale' ? 'quote-stale' : ''}">${escapeHtml(stockQuoteStatus(item))}</small>` : item.observed_at ? `<small>Observed ${escapeHtml(date(item.observed_at))}</small>` : '';
-      const change = stock ? `${present(item.stock_change_percent) ? `${number(item.stock_change_percent)}%` : '—'}<small>${item.cache_status === 'manual' ? 'Not provided' : 'Close-to-close'}</small>` : `${present(item.price_change_24h) ? `${number(item.price_change_24h)}%` : '—'}<small>24h</small>`;
+      const quote = stock ? `<small class="quote-meta ${simulated ? 'synthetic-label' : ''}">${escapeHtml(stockQuoteTime(item))}</small><small class="quote-meta ${item.cache_status === 'stale' ? 'quote-stale' : ''}">${escapeHtml(stockQuoteStatus(item))}</small>${isFinnhub(item) ? '<small class="quote-meta">Provider quote may be delayed or stale</small>' : ''}` : item.observed_at ? `<small>Observed ${escapeHtml(date(item.observed_at))}</small>` : '';
+      const change = stock ? `${present(item.stock_change_percent) ? `${number(item.stock_change_percent)}%` : '—'}<small>${simulated ? 'Synthetic' : isFinnhub(item) ? 'Provider change' : item.cache_status === 'manual' ? 'Not provided' : 'Close-to-close'}</small>` : `${present(item.price_change_24h) ? `${number(item.price_change_24h)}%` : '—'}<small>24h</small>`;
       const liquidity = stock ? '—<small>Not assessed</small>' : `${money(item.liquidity_usd)}<small>USD</small>`;
-      const volume = stock ? `${number(item.stock_volume_shares)}<small>Shares · ${item.cache_status === 'manual' ? 'user input' : 'quote day'}</small>` : `${money(item.volume_24h)}<small>USD · 24h</small>`;
+      const volume = stock ? (isFinnhub(item) || simulated) ? (present(item.stock_volume_shares) ? `${number(item.stock_volume_shares)}<small>Shares${simulated ? ' · synthetic' : ''}</small>` : 'Unavailable<small>Shares</small>') : `${number(item.stock_volume_shares)}<small>Shares · ${item.cache_status === 'manual' ? 'user input' : 'quote day'}</small>` : `${money(item.volume_24h)}<small>USD · 24h</small>`;
       const trend = stock ? '—' : `${present(item.volume_spike_ratio) ? `${number(item.volume_spike_ratio)}×` : '—'}<small>1h vs prior 23h avg</small>`;
       const review = stock ? '<span class="risk-pill">Not assessed</span><small>No stock liquidity or rug assessment</small>' : `<span class="risk-pill" title="${escapeHtml(item.reason || '')}">${escapeHtml(item.risk_status || '—')}</span>${item.reason ? `<small title="${escapeHtml(item.reason)}">${escapeHtml(item.reason)}</small>` : ''}`;
-      const action = stock && item.symbol && present(item.price_usd) && Number(item.price_usd) > 0 ? `<button class="text-button quote-button" type="button" data-use-quote="${index}" aria-label="Use quote for ${symbol} in the ledger">Use quote <svg><use href="#i-arrow"/></svg></button>` : '';
-      return `<tr><td>${asset}${action}</td><td>${price(item.price_usd)}${quote}</td><td>${change}</td><td>${liquidity}</td><td>${volume}</td><td>${trend}</td><td>${review}</td></tr>`;
+      const action = simulated ? '<button class="text-button quote-button" type="button" data-view-demo>View demo <svg><use href="#i-arrow"/></svg></button>' : stock && item.symbol && present(item.price_usd) && Number(item.price_usd) > 0 ? `<button class="text-button quote-button" type="button" data-use-quote="${index}" aria-label="Use quote for ${symbol} in the ledger">Use quote <svg><use href="#i-arrow"/></svg></button>` : '';
+      return `<tr><td>${asset}${action}</td><td>${simulated ? money(item.price_usd) : price(item.price_usd)}${quote}</td><td>${change}</td><td>${liquidity}</td><td>${volume}</td><td>${trend}</td><td>${review}</td></tr>`;
     }).join('');
   }
   function renderPositions(items) {
@@ -163,11 +177,16 @@
     $('#activity-list').innerHTML = items.slice(0, 8).map(item => `<div class="activity-item"><span class="activity-dot ${/error|fail/i.test(item.level || '') ? 'error' : /warn/i.test(item.level || '') ? 'warning' : ''}"></span><div class="activity-message">${escapeHtml(item.message || '—')}<small>${escapeHtml(item.agent || 'System')}</small></div><time class="activity-time">${escapeHtml(date(item.timestamp))}</time></div>`).join('');
   }
   const marketNames = {stocks:'Stocks', crypto:'Crypto', both:'Both'};
+  const stockSourceNames = Object.assign(Object.create(null), {api:'API only', csv:'CSV only', both:'API + CSV', simulation:'SYNTHETIC / NOT MARKET DATA — simulation only'});
+  const stockProviderNames = Object.assign(Object.create(null), {alpha_vantage:'Alpha Vantage', finnhub:'Finnhub'});
+  const savedStockSource = settings => settings.stock_source_mode == null ? 'both' : settings.stock_source_mode;
+  const savedStockProvider = settings => settings.stock_provider == null ? 'alpha_vantage' : settings.stock_provider;
   const scannerDraftKey = 'ledger-six-scanner-drafts-v1';
   function persistScannerDrafts() {
     const draft = {};
     if (state.marketDirty) draft.market = $('#market-form').elements.market_mode.value;
     if (state.watchlistDirty) draft.watchlist = $('#stock-symbols-form').elements.stock_symbols.value;
+    if (state.stockSourceDirty) { draft.stockSource = $('#stock-source-mode').value; draft.stockProvider = $('#stock-provider-select').value; }
     const csv = $('#stock-import-form').elements.csv.value;
     if (csv) draft.csv = csv;
     try { if (Object.keys(draft).length) sessionStorage.setItem(scannerDraftKey, JSON.stringify(draft)); else sessionStorage.removeItem(scannerDraftKey); } catch (_) {}
@@ -177,6 +196,7 @@
       const draft = JSON.parse(sessionStorage.getItem(scannerDraftKey) || '{}');
       if (typeof draft.market === 'string' && marketNames[draft.market]) { $('#market-form').elements.market_mode.value = draft.market; state.marketDirty = true; }
       if (typeof draft.watchlist === 'string') { $('#stock-symbols-form').elements.stock_symbols.value = draft.watchlist; state.watchlistDirty = true; }
+      if (typeof draft.stockSource === 'string' && stockSourceNames[draft.stockSource] && typeof draft.stockProvider === 'string' && stockProviderNames[draft.stockProvider]) { $('#stock-source-mode').value = draft.stockSource; $('#stock-provider-select').value = draft.stockProvider; state.stockSourceDirty = true; }
       if (typeof draft.csv === 'string') $('#stock-import-form').elements.csv.value = draft.csv;
     } catch (_) {}
   }
@@ -197,22 +217,98 @@
     form.elements.stock_symbols.disabled = !isAdmin() || !available || state.watchlistSaving || state.scanRunning;
     $('button[type=submit]', form).disabled = !isAdmin() || !available || state.watchlistSaving || state.scanRunning || !state.watchlistDirty;
     if (available && !state.watchlistDirty && !state.watchlistSaving) form.elements.stock_symbols.value = (Array.isArray(settings.stock_symbols) ? settings.stock_symbols : []).join(', ');
-    $('#stock-settings-status').textContent = !available ? 'Saved watchlist unavailable.' : state.watchlistDirty ? 'Watchlist has unsaved changes. Save or revert before scanning or running a cycle.' : 'Watchlist saved. Scans use this Alpha Vantage list.';
+    $('#stock-settings-status').textContent = !available ? 'Saved watchlist unavailable.' : state.watchlistDirty ? 'Watchlist has unsaved changes. Save or revert before scanning or running a cycle.' : 'Watchlist saved. API and simulation use this list; CSV-only shows saved imports.';
+  }
+  function renderStockSource(settings, available) {
+    const form = $('#stock-provider-form'), source = savedStockSource(settings), provider = savedStockProvider(settings);
+    const valid = available && !!stockSourceNames[source] && !!stockProviderNames[provider];
+    if (valid && !state.stockSourceDirty && !state.stockSourceSaving) { form.elements.stock_source_mode.value = source; form.elements.stock_provider.value = provider; }
+    const locked = !isAdmin() || !valid || state.stockSourceSaving || state.scanRunning || state.keySaving || state.simulationRunning;
+    form.elements.stock_source_mode.disabled = locked;
+    form.elements.stock_provider.disabled = locked;
+    // A missing optional endpoint must not break the rest of an older server's UI.
+    const finnhubOption = $('option[value="finnhub"]', form.elements.stock_provider);
+    finnhubOption.disabled = state.finnhubUnavailable && provider !== 'finnhub' && form.elements.stock_provider.value !== 'finnhub';
+    $('button[type=submit]', form).disabled = locked || !state.stockSourceDirty || (form.elements.stock_provider.value === 'finnhub' && state.finnhubUnavailable && provider !== 'finnhub');
+    $('#stock-provider-status').textContent = !valid ? 'Saved stock source or API provider unavailable.' : state.stockSourceDirty ? `Saved: ${stockSourceNames[source]} · API provider: ${stockProviderNames[provider]}. Changes are not saved; save or revert before scanning.` : `Saved: ${stockSourceNames[source]} · API provider: ${stockProviderNames[provider]}.`;
+    renderSimulation();
   }
   function renderStockContext() {
-    if (!isAdmin()) {
-      $('#stock-scan-context').textContent = 'Automated stock source: Alpha Vantage · Provider configuration is managed by an administrator. Yahoo Finance quotes are manual import only.';
-      return;
+    const settings = state.dashboard?.settings;
+    if (!settings) { $('#stock-scan-context').textContent = 'Saved stock source unavailable.'; return; }
+    const source = savedStockSource(settings), provider = savedStockProvider(settings);
+    if (!stockSourceNames[source] || !stockProviderNames[provider]) { $('#stock-scan-context').textContent = 'Saved stock source unavailable. Refresh settings before scanning.'; return; }
+    let status = '';
+    if (isAdmin() && (source === 'api' || source === 'both')) {
+      const data = provider === 'finnhub' ? state.finnhubData : state.marketData;
+      status = !data ? ' · key status unavailable' : data.using_demo ? ' · demo mode, IBM only' : data.has_api_key ? ' · API key saved' : ' · no API key saved';
     }
-    const alpha = state.marketData;
-    const status = !alpha ? 'key status unavailable' : alpha.using_demo ? 'demo mode, IBM only' : alpha.has_api_key ? 'API key saved' : 'no API key saved';
-    $('#stock-scan-context').textContent = `Automated stock source: Alpha Vantage · ${status}. Yahoo Finance is manual import only.`;
+    const suffix = source === 'simulation' ? ' · Synthetic values are not market data.' : source === 'csv' ? ' · Saved manual imports only; no stock API requests.' : `${source === 'both' ? ' · API and CSV quotes are separate; symbols may appear twice.' : ''} · Quotes may be delayed or stale.`;
+    $('#stock-scan-context').textContent = `Saved stock source: ${stockSourceNames[source]}${source === 'api' || source === 'both' ? ` · API: ${stockProviderNames[provider]}${status}` : ''}${suffix}${isAdmin() ? '' : ' · Administrator managed.'}`;
   }
   function renderMarketData(data) {
-    state.marketData = data;
-    $('#market-data-status').textContent = data.using_demo ? 'Alpha Vantage · Demo mode: IBM only (no key configured).' : data.has_api_key ? 'Alpha Vantage · API key saved; never displayed.' : 'Alpha Vantage · No API key saved.';
-    $('#clear-market-key').disabled = !data.has_api_key;
+    if (typeof data?.has_api_key !== 'boolean' || typeof data?.using_demo !== 'boolean') throw new Error('Invalid Alpha Vantage status.');
+    state.marketData = {has_api_key:data.has_api_key, using_demo:data.using_demo};
+    renderKeyControls();
     renderStockContext();
+  }
+  function renderFinnhubData(data) {
+    if (typeof data?.has_api_key !== 'boolean') throw new Error('Invalid Finnhub status.');
+    state.finnhubData = {has_api_key:data.has_api_key, using_demo:false}; state.finnhubUnavailable = false;
+    renderKeyControls(); renderStockSource(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderStockContext();
+  }
+  function renderKeyControls() {
+    const alpha = state.marketData, finn = state.finnhubData, locked = !isAdmin() || state.keySaving || state.scanRunning || state.stockSourceSaving;
+    $('#market-data-status').textContent = !alpha ? 'Alpha Vantage key status unavailable.' : alpha.using_demo ? 'Alpha Vantage · Demo mode: IBM only (no key configured).' : alpha.has_api_key ? 'Alpha Vantage · API key saved; never displayed.' : 'Alpha Vantage · No API key saved.';
+    $('#finnhub-data-status').textContent = !finn ? 'Finnhub key status unavailable. Refresh to retry; other features remain available.' : finn.has_api_key ? 'Finnhub · API key saved; never displayed.' : 'Finnhub · No API key saved; a separate key is required.';
+    $('#market-data-form').elements.api_key.disabled = locked;
+    $('button[type=submit]', $('#market-data-form')).disabled = locked;
+    $('#clear-market-key').disabled = locked || !alpha?.has_api_key;
+    $('#finnhub-data-form').elements.api_key.disabled = locked || !finn;
+    $('button[type=submit]', $('#finnhub-data-form')).disabled = locked || !finn;
+    $('#clear-finnhub-key').disabled = locked || !finn?.has_api_key;
+  }
+  function renderSimulationCurve(points) {
+    const svg = $('#simulation-chart'), empty = $('#simulation-chart-empty');
+    const valid = (Array.isArray(points) ? points : []).filter(p => p && present(p.step) && present(p.equity));
+    empty.hidden = valid.length > 0;
+    svg.hidden = valid.length === 0;
+    if (!valid.length) { svg.innerHTML = ''; svg.setAttribute('aria-label', 'Synthetic demo equity curve unavailable'); return; }
+    const values = valid.map(p => Number(p.equity)), min = Math.min(...values), max = Math.max(...values);
+    const spread = max - min || Math.max(Math.abs(max) * 0.01, 1), lo = min - spread * 0.15, hi = max + spread * 0.15;
+    const coordinates = values.map((value, index) => [valid.length === 1 ? 300 : 10 + index * 580 / (valid.length - 1), 125 - 110 * (value - lo) / (hi - lo)]);
+    const path = coordinates.map(([x, y], index) => `${index ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)}`).join(' ');
+    const [x, y] = coordinates[coordinates.length - 1];
+    svg.innerHTML = `<line x1="10" y1="125" x2="590" y2="125" class="simulation-grid"/><line x1="10" y1="70" x2="590" y2="70" class="simulation-grid"/><line x1="10" y1="15" x2="590" y2="15" class="simulation-grid"/><path d="${path}" class="simulation-line"/><circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="4" class="simulation-point"/>`;
+    svg.setAttribute('aria-label', `Synthetic demo equity curve, ${valid.length} steps, from ${money(values[0])} to ${money(values[values.length - 1])}.`);
+  }
+  function renderSimulation() {
+    const data = state.simulation, available = !!data && !state.simulationUnavailable;
+    const saved = state.dashboard?.settings && savedStockSource(state.dashboard.settings) === 'simulation';
+    $('#simulation-cycle').disabled = !saved || !available || data.enabled !== true || state.stockSourceDirty || state.stockSourceSaving || state.simulationRunning || state.simulationLoading || state.scanRunning;
+    $('#simulation-refresh').disabled = state.simulationLoading || state.simulationRunning;
+    $('#simulation-status').textContent = state.simulationLoading ? 'Loading demo portfolio…' : !available ? 'Demo portfolio unavailable. Refresh demo to retry; the shared ledger is unaffected.' : state.simulationRunning ? 'Running a synthetic cycle…' : state.stockSourceDirty ? 'Save or revert the stock source changes before running a demo cycle.' : !saved ? 'Demo is viewable, but select and save Simulation as the stock source to run a cycle.' : data.enabled !== true ? 'Simulation is selected, but the demo is not enabled. Refresh demo to check its status.' : 'Simulation selected. Run a cycle manually when ready. All values below are synthetic.';
+    $('#simulation-initial-cash').textContent = available ? money(data.initial_cash) : '—';
+    $('#simulation-cash').textContent = available ? money(data.cash) : '—';
+    $('#simulation-equity').textContent = available ? money(data.equity) : '—';
+    $('#simulation-step').textContent = available ? number(data.step) : '—';
+    renderSimulationCurve(available ? data.equity_curve : []);
+    $('#simulation-rules').textContent = available && typeof data.rules === 'string' && data.rules.trim() ? data.rules : 'Demo rules unavailable.';
+    const positions = available && Array.isArray(data.positions) ? data.positions.filter(item => item && typeof item === 'object') : [];
+    const trades = available && Array.isArray(data.trades) ? data.trades.filter(item => item && typeof item === 'object') : [];
+    const activity = available && Array.isArray(data.activity) ? data.activity : [];
+    $('#simulation-positions').innerHTML = positions.map(item => `<tr><td>${escapeHtml(item.symbol || '—')}</td><td>${number(item.quantity)}</td><td>${money(item.entry_price)}</td><td>${money(item.mark_price)}</td><td>${money(item.unrealized_pnl)}</td></tr>`).join('');
+    $('#simulation-trades').innerHTML = trades.map(item => `<tr><td>${escapeHtml(date(item.timestamp))}</td><td>${escapeHtml(item.symbol || '—')}</td><td>${escapeHtml(item.side || '—')}</td><td>${number(item.quantity)}</td><td>${money(item.price)}</td><td>${escapeHtml(item.reason || '—')}</td></tr>`).join('');
+    $('#simulation-activity').innerHTML = activity.map(item => {
+      const stage = item && typeof item === 'object' ? [item.agent, present(item.step) ? `step ${number(item.step)}` : ''].filter(Boolean).join(' · ') : '';
+      return `<li>${stage ? `<strong>${escapeHtml(stage)}</strong> · ` : ''}${escapeHtml(typeof item === 'string' ? item : item?.message || item?.detail || 'Activity unavailable')}${item && typeof item === 'object' && item.timestamp ? ` <small>· ${escapeHtml(date(item.timestamp))}</small>` : ''}</li>`;
+    }).join('');
+    $('#simulation-positions-empty').hidden = positions.length > 0;
+    $('#simulation-trades-empty').hidden = trades.length > 0;
+    $('#simulation-activity-empty').hidden = activity.length > 0;
+    $('#simulation-positions-empty').textContent = available && Array.isArray(data.positions) ? 'No demo positions.' : 'Demo positions unavailable.';
+    $('#simulation-trades-empty').textContent = available && Array.isArray(data.trades) ? 'No demo trades.' : 'Demo trades unavailable.';
+    $('#simulation-activity-empty').textContent = available && Array.isArray(data.activity) ? 'No demo activity.' : 'Demo activity unavailable.';
   }
   // Scanner diagnostics are application-authored messages, never provider payloads.
   // Refuse obvious raw payloads, URLs and credential assignments as a defense in depth.
@@ -229,19 +325,27 @@
   const scanWarningsKey = 'ledger-six-scan-warnings-v1';
   function setScanWarnings(warnings) {
     state.scanWarnings = warnings.map(safeScannerMessage);
-    try { if (state.scanWarnings.length) sessionStorage.setItem(scanWarningsKey, JSON.stringify(state.scanWarnings)); else sessionStorage.removeItem(scanWarningsKey); } catch (_) {}
     showScanWarnings(state.scanWarnings);
   }
   function showScanWarnings(warnings) {
     const el = $('#scan-warnings');
-    el.textContent = warnings.length ? `Scanner notices — results may be incomplete or stale:\n${warnings.map(message => `• ${message}`).join('\n')}` : '';
+    const quotaHelp = warnings.some(message => /quota|rate[ -]?limit|too many requests|throttl/i.test(message)) ? '\n• Try CSV or Simulation, or use a separately configured provider. Retry the limited provider only when it permits. Stale cached quotes were not refreshed.' : '';
+    el.textContent = warnings.length ? `Scanner notices — results may be incomplete or stale:\n${warnings.map(message => `• ${message}`).join('\n')}${quotaHelp}` : '';
     el.hidden = !warnings.length;
   }
   function restoreScanWarnings() {
-    try { const saved = JSON.parse(sessionStorage.getItem(scanWarningsKey) || '[]'); if (Array.isArray(saved)) state.scanWarnings = saved.map(safeScannerMessage); } catch (_) {}
+    // Older releases persisted notices without their source or scan timestamp.
+    // Discard those historical notices rather than displaying them as current.
+    try { sessionStorage.removeItem(scanWarningsKey); } catch (_) {}
     showScanWarnings(state.scanWarnings);
   }
   function renderDashboard(data, preserveSettings = false) {
+    const priorSource = state.dashboard?.settings ? savedStockSource(state.dashboard.settings) : null;
+    const previous = state.dashboard?.settings;
+    if (previous && data.settings && (previous.market_mode !== data.settings.market_mode ||
+        savedStockSource(previous) !== savedStockSource(data.settings) ||
+        savedStockProvider(previous) !== savedStockProvider(data.settings) ||
+        JSON.stringify(previous.stock_symbols) !== JSON.stringify(data.settings.stock_symbols))) setScanWarnings([]);
     state.dashboard = data; const s = data.summary || {};
     setValue('#metric-equity', money(s.equity)); setValue('#metric-cash', money(s.cash)); setPnl('#metric-realized', s.realized_pnl); setValue('#metric-positions', number(s.open_positions));
     $('#metric-unrealized').textContent = `Unrealized P&L: ${money(s.unrealized_pnl)}`;
@@ -250,7 +354,8 @@
     const settings = data.settings || {}; const hasAuto = typeof settings.auto_paper === 'boolean';
     const toggle = $('#auto-toggle'); toggle.disabled = !isAdmin() || !hasAuto; toggle.setAttribute('aria-checked', String(hasAuto && settings.auto_paper));
     $('#auto-description').textContent = !hasAuto ? 'Setting unavailable' : `${settings.auto_paper ? 'Enabled · eligible crypto, manual cycles only' : 'Blocked · manual cycles only'}${isAdmin() ? '' : ' · Admin controlled'}`;
-    renderMarketSelection(settings, !!data.settings); renderWatchlist(settings, !!data.settings);
+    renderMarketSelection(settings, !!data.settings); renderWatchlist(settings, !!data.settings); renderStockSource(settings, !!data.settings); renderStockContext();
+    if (priorSource && data.settings && priorSource !== savedStockSource(settings) && !state.simulationLoading && !state.simulationRunning) refreshSimulation().catch(() => {});
     if (!preserveSettings) { const form = $('#settings-form'); settingFields.forEach(key => { form.elements[key].value = settings[key] ?? ''; }); form.elements.auto_paper.checked = !!settings.auto_paper; }
   }
   function renderProviders(data) {
@@ -273,12 +378,27 @@
   async function refreshDashboard(preserveSettings = false) { const sequence = ++dashboardRequestSequence; const data = await api('/api/dashboard'); if (sequence === dashboardRequestSequence) { renderDashboard(data, preserveSettings); setConnection(true); } return data; }
   async function refreshProviders() { const data = await api('/api/llm'); renderProviders(data); return data; }
   async function refreshMarketData() { const data = await api('/api/market-data'); renderMarketData(data); return data; }
+  async function refreshFinnhubData() { const data = await api('/api/market-data/finnhub'); renderFinnhubData(data); return data; }
+  let simulationRequest = null;
+  function refreshSimulation() {
+    if (simulationRequest) return simulationRequest;
+    state.simulationLoading = true; renderSimulation();
+    simulationRequest = (async () => { try {
+      const data = await api('/api/simulation/stocks');
+      if (!data || typeof data !== 'object' || typeof data.enabled !== 'boolean') throw new Error('Invalid demo portfolio.');
+      state.simulation = data; state.simulationUnavailable = false;
+      return data;
+    } catch (e) { state.simulation = null; state.simulationUnavailable = true; throw e; }
+    finally { state.simulationLoading = false; simulationRequest = null; renderSimulation(); } })();
+    return simulationRequest;
+  }
   async function refreshAfterMutation(fn) { try { await fn(); } catch (e) { throw new Error(`Action completed, but refresh failed. Verify the result before retrying. ${errorText(e)}`); } }
   async function refreshAll(showSuccess = false) {
     await sessionReady;
-    const results = await Promise.allSettled([refreshDashboard(), isAdmin() ? refreshProviders() : Promise.resolve(), api('/api/health'), isAdmin() ? refreshMarketData() : Promise.resolve()]);
+    const results = await Promise.allSettled([refreshDashboard(), isAdmin() ? refreshProviders() : Promise.resolve(), api('/api/health'), isAdmin() ? refreshMarketData() : Promise.resolve(), isAdmin() ? refreshFinnhubData() : Promise.resolve(), refreshSimulation()]);
     if (authLost) return;
-    if (results[3].status === 'rejected') { state.marketData = null; $('#market-data-status').textContent = 'Alpha Vantage key status unavailable.'; $('#clear-market-key').disabled = true; renderStockContext(); }
+    if (results[3].status === 'rejected') { state.marketData = null; renderKeyControls(); renderStockContext(); }
+    if (results[4].status === 'rejected') { state.finnhubData = null; state.finnhubUnavailable = true; renderKeyControls(); renderStockSource(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderStockContext(); }
     if (results[0].status === 'rejected') { setConnection(false); notice(`Dashboard unavailable: ${errorText(results[0].reason)}`, true); }
     else if (results[1].status === 'rejected') notice(`Provider settings unavailable: ${errorText(results[1].reason)}`, true);
     else if (results[2].status === 'rejected') { setConnection(false); notice(`Health check unavailable: ${errorText(results[2].reason)}`, true); }
@@ -294,14 +414,14 @@
     if (state.scanRunning) return;
     state.scanRunning = true;
     const buttons = $$('[data-action]'); buttons.forEach(button => { button.disabled = true; });
-    renderMarketSelection(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderWatchlist(state.dashboard?.settings || {}, !!state.dashboard?.settings);
+    renderMarketSelection(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderWatchlist(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderStockSource(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderKeyControls();
     const label = action === 'scan' ? 'Scanner' : 'Paper cycle';
     try {
       const result = await api(`/api/${action}`, {method:'POST'});
       if (result?.success === false || result?.ok === false) throw new Error(safeScannerMessage(result.message ?? result.detail ?? 'No successful scan was reported.'));
       const warnings = warningMessages(result);
       if (Array.isArray(result?.candidates) && result.candidates.some(item => item.asset_type === 'stock' && item.cache_status === 'stale') && !warnings.some(message => /stale|older cached/i.test(message))) {
-        warnings.push('Older cached stock quotes are shown and may be stale. Verify the trading day and original fetch time before using them.');
+        warnings.push('Older cached stock quotes were not refreshed and may be stale. Verify the provider timestamp or trading day and original fetch time before using them.');
       }
       setScanWarnings(warnings);
       try { await refreshAfterMutation(() => refreshDashboard(true)); }
@@ -314,18 +434,20 @@
       const detail = safeScannerMessage(errorText(e));
       const prefix = /all requested market sources failed/i.test(detail) ? `${label} did not complete.` : `${label} result could not be confirmed.`;
       const message = `${prefix} ${detail} Previously displayed results may still be shown and may be stale.`;
-      setScanWarnings([...state.scanWarnings, message]); notice(message, true);
+      setScanWarnings([message]); notice(message, true);
       try { await refreshDashboard(true); } catch (_) { setConnection(false); }
-    } finally { state.scanRunning = false; buttons.forEach(button => { button.disabled = false; }); renderMarketSelection(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderWatchlist(state.dashboard?.settings || {}, !!state.dashboard?.settings); }
+    } finally { state.scanRunning = false; buttons.forEach(button => { button.disabled = false; }); renderMarketSelection(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderWatchlist(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderStockSource(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderKeyControls(); }
   }
   $$('.nav-link').forEach(button => button.addEventListener('click', () => { const page = button.dataset.page; $$('.page').forEach(el => { el.hidden = el.id !== `page-${page}`; }); $$('.nav-link').forEach(el => { const active = el === button; el.classList.toggle('active', active); if (active) el.setAttribute('aria-current','page'); else el.removeAttribute('aria-current'); }); $('#breadcrumb-page').textContent = page.toUpperCase(); if (page === 'settings' && isAdmin()) loadUsers(); window.scrollTo(0,0); }));
   function updateThemeButton() { const light = document.documentElement.dataset.theme === 'light'; $('#theme-toggle').setAttribute('aria-label', light ? 'Switch to dark mode' : 'Switch to light mode'); }
   updateThemeButton(); $('#theme-toggle').addEventListener('click', () => { const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = theme; try { localStorage.setItem('ledger-six-theme', theme); } catch (_) {} updateThemeButton(); });
   $('#refresh-button').addEventListener('click', async event => { const button = event.currentTarget; button.disabled = true; try { await refreshAll(true); } finally { button.disabled = false; } });
   $$('[data-action]').forEach(button => button.addEventListener('click', () => {
-    if (state.marketDirty || state.watchlistDirty || state.marketSaving || state.watchlistSaving) { notice('Save or revert the market selection and Alpha Vantage watchlist changes before running the scanner or cycle.', true); return; }
+    if (state.marketDirty || state.watchlistDirty || state.marketSaving || state.watchlistSaving || state.stockSourceDirty || state.stockSourceSaving || state.keySaving || state.simulationRunning || $('#market-data-form').elements.api_key.value || $('#finnhub-data-form').elements.api_key.value) { notice('Save or revert the market, stock source, API provider, watchlist and key changes before running the scanner or cycle.', true); return; }
     const settings = state.dashboard?.settings;
-    if (!settings || !marketNames[settings.market_mode] || !Array.isArray(settings.stock_symbols) || !validWatchlist(settings.stock_symbols)) { notice('Saved market selection or stock watchlist is unavailable. Refresh settings before running the scanner or cycle.', true); return; }
+    const source = settings && savedStockSource(settings), provider = settings && savedStockProvider(settings);
+    if (!settings || !marketNames[settings.market_mode] || !stockSourceNames[source] || !stockProviderNames[provider] || (settings.market_mode !== 'crypto' && (source === 'api' || source === 'both') && (!Array.isArray(settings.stock_symbols) || !validWatchlist(settings.stock_symbols)))) { notice('Saved market, stock source, provider or watchlist is unavailable. Refresh settings before running the scanner or cycle.', true); return; }
+    if (isAdmin() && settings.market_mode !== 'crypto' && source === 'api' && provider === 'finnhub' && state.finnhubData && !state.finnhubData.has_api_key) { notice('Save a separate Finnhub key before scanning with Finnhub, or choose another stock source.', true); return; }
     return runScanAction(button.dataset.action);
   }));
   $('#market-form').addEventListener('change', event => {
@@ -342,6 +464,7 @@
     state.marketSaving = true; renderMarketSelection(state.dashboard?.settings || {}, !!state.dashboard?.settings);
     try {
       await api('/api/settings', json('PUT', {market_mode:mode}));
+      setScanWarnings([]);
       state.marketDirty = false;
       if (state.dashboard?.settings) state.dashboard.settings.market_mode = mode;
       persistScannerDrafts();
@@ -349,6 +472,33 @@
       notice(`Markets set to ${marketNames[mode]}.`);
     } catch (e) { notice(errorText(e), true); }
     finally { state.marketSaving = false; renderMarketSelection(state.dashboard?.settings || {}, !!state.dashboard?.settings); }
+  });
+  $('#stock-provider-form').addEventListener('change', event => {
+    if (!['stock_source_mode','stock_provider'].includes(event.target.name)) return;
+    const settings = state.dashboard?.settings || {}, form = event.currentTarget;
+    state.stockSourceDirty = form.elements.stock_source_mode.value !== savedStockSource(settings) || form.elements.stock_provider.value !== savedStockProvider(settings);
+    persistScannerDrafts(); renderStockSource(settings, !!state.dashboard?.settings);
+  });
+  $('#stock-provider-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget, source = form.elements.stock_source_mode.value, provider = form.elements.stock_provider.value;
+    if (!isAdmin() || !state.stockSourceDirty || state.stockSourceSaving || state.scanRunning || state.keySaving || state.simulationRunning || !stockSourceNames[source] || !stockProviderNames[provider] || (provider === 'finnhub' && state.finnhubUnavailable && savedStockProvider(state.dashboard?.settings || {}) !== 'finnhub')) return;
+    state.stockSourceSaving = true; renderStockSource(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderKeyControls();
+    try {
+      await api('/api/settings', json('PUT', {stock_source_mode:source, stock_provider:provider}));
+      setScanWarnings([]);
+      await refreshDashboard(true);
+      const settings = state.dashboard?.settings;
+      if (!settings || savedStockSource(settings) !== source || savedStockProvider(settings) !== provider) throw new Error('not confirmed');
+      state.stockSourceDirty = false; persistScannerDrafts();
+      try {
+        await refreshSimulation();
+        // A request started before the mode change may have returned its old status.
+        if (state.simulation && state.simulation.enabled !== (source === 'simulation')) await refreshSimulation();
+      } catch (_) {} // Optional on older servers.
+      notice('Stock source and API provider saved. Save a Finnhub key separately if it is required.');
+    } catch (_) { notice('Stock source could not be saved or verified. Refresh and check the saved selection before retrying.', true); }
+    finally { state.stockSourceSaving = false; renderStockSource(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderKeyControls(); renderStockContext(); }
   });
   $('#stock-symbols-form').addEventListener('input', event => {
     const symbols = watchlistSymbols(event.currentTarget.elements.stock_symbols.value), saved = state.dashboard?.settings?.stock_symbols;
@@ -365,11 +515,12 @@
     state.watchlistSaving = true; renderWatchlist(state.dashboard?.settings || {}, !!state.dashboard?.settings);
     try {
       await api('/api/settings', json('PUT', {stock_symbols:symbols}));
+      setScanWarnings([]);
       state.watchlistDirty = false;
       if (state.dashboard?.settings) state.dashboard.settings.stock_symbols = symbols;
       persistScannerDrafts();
       await refreshAfterMutation(() => refreshDashboard(true));
-      notice('Alpha Vantage stock watchlist saved.');
+      notice('Stock watchlist saved.');
     } catch (e) { notice(errorText(e), true); }
     finally { state.watchlistSaving = false; renderWatchlist(state.dashboard?.settings || {}, !!state.dashboard?.settings); }
   });
@@ -386,7 +537,7 @@
       if (!Number.isInteger(result.imported) || result.imported < 1 || result.imported > 25) throw new Error('The import result could not be confirmed. Verify before retrying.');
       const warnings = warningMessages(result);
       form.elements.csv.value = ''; persistScannerDrafts();
-      const message = `Imported ${result.imported} quote${result.imported === 1 ? '' : 's'}. View them on the dashboard when Stocks or Both is selected. The previous manual import was replaced.`;
+      const message = `Imported ${result.imported} quote${result.imported === 1 ? '' : 's'}. View them when the market includes stocks and the saved stock source is CSV or API + CSV. The previous manual import was replaced.`;
       $('#stock-import-status').textContent = warnings.length ? `${message}\n${warnings.join('\n')}` : message;
       try { await refreshDashboard(true); }
       catch (_) { notice(`${message} Dashboard refresh failed; refresh to verify before retrying.`, true); return; }
@@ -394,24 +545,46 @@
     } catch (e) { notice(errorText(e), true); }
     finally { state.importSaving = false; form.elements.csv.disabled = false; $('button[type=submit]', form).disabled = false; }
   });
-  $('#market-data-form').addEventListener('submit', event => {
-    event.preventDefault();
-    const form = event.currentTarget, key = form.elements.api_key.value.trim();
-    if (!key) { notice('Enter a new Alpha Vantage API key to save it.', true); return; }
-    runAction($('button[type=submit]', form), async () => {
-      await api('/api/market-data', json('PUT', {api_key:key}));
-      form.elements.api_key.value = '';
-      await refreshAfterMutation(refreshMarketData);
-    }, 'Stock market data key saved.');
-  });
-  $('#clear-market-key').addEventListener('click', async event => {
-    const button = event.currentTarget;
-    await runAction(button, async () => {
-      await api('/api/market-data', json('PUT', {clear_key:true}));
-      $('#market-data-form').elements.api_key.value = '';
-      await refreshAfterMutation(refreshMarketData);
-    }, 'Stock market data key cleared.');
-    button.disabled = !state.marketData?.has_api_key;
+  async function changeStockKey(provider, clear = false) {
+    if (!isAdmin() || state.keySaving || state.scanRunning || state.stockSourceSaving) return;
+    const finn = provider === 'finnhub', form = $(finn ? '#finnhub-data-form' : '#market-data-form');
+    if (finn && !state.finnhubData) return;
+    const key = form.elements.api_key.value.trim();
+    if (!clear && !key) { notice(`Enter a new ${finn ? 'Finnhub' : 'Alpha Vantage'} API key to save it.`, true); return; }
+    // Never leave a submitted secret in the DOM, including on failure.
+    form.elements.api_key.value = '';
+    state.keySaving = true; renderKeyControls(); renderStockSource(state.dashboard?.settings || {}, !!state.dashboard?.settings);
+    let saved = false;
+    try {
+      await api(finn ? '/api/market-data/finnhub' : '/api/market-data', json('PUT', clear ? {clear_key:true} : {api_key:key}));
+      setScanWarnings([]);
+      saved = true;
+      await (finn ? refreshFinnhubData() : refreshMarketData());
+      notice(`${finn ? 'Finnhub' : 'Alpha Vantage'} key ${clear ? 'cleared' : 'saved'}.`);
+    } catch (_) {
+      if (saved) { if (finn) { state.finnhubData = null; state.finnhubUnavailable = true; } else state.marketData = null; }
+      notice(saved ? 'Key change completed, but its status could not be verified. Refresh before retrying.' : 'Key change could not be confirmed. Refresh the status before retrying; re-enter the key if needed.', true);
+    } finally { state.keySaving = false; renderKeyControls(); renderStockSource(state.dashboard?.settings || {}, !!state.dashboard?.settings); renderStockContext(); }
+  }
+  $('#market-data-form').addEventListener('submit', event => { event.preventDefault(); changeStockKey('alpha_vantage'); });
+  $('#finnhub-data-form').addEventListener('submit', event => { event.preventDefault(); changeStockKey('finnhub'); });
+  $('#clear-market-key').addEventListener('click', () => changeStockKey('alpha_vantage', true));
+  $('#clear-finnhub-key').addEventListener('click', () => changeStockKey('finnhub', true));
+  $('#simulation-refresh').addEventListener('click', async () => { try { await refreshSimulation(); } catch (_) { /* Status is displayed in the demo panel. */ } });
+  $('#simulation-cycle').addEventListener('click', async () => {
+    const settings = state.dashboard?.settings;
+    if (!settings || savedStockSource(settings) !== 'simulation' || state.stockSourceDirty || state.stockSourceSaving || state.scanRunning || state.simulationLoading || state.simulationRunning || !state.simulation || state.simulation.enabled !== true) return;
+    state.simulationRunning = true; renderSimulation(); renderStockSource(settings, true);
+    try {
+      const result = await api('/api/simulation/stocks/cycle', {method:'POST'});
+      if (result?.success === false || result?.ok === false) throw new Error('The synthetic cycle was not completed.');
+      const results = await Promise.allSettled([refreshSimulation(), refreshDashboard(true)]);
+      if (results.some(result => result.status === 'rejected')) notice('Synthetic cycle returned, but a refresh failed. Verify the demo state before retrying.', true);
+      else notice('Synthetic stock cycle completed. The shared paper ledger was not changed.');
+    } catch (_) {
+      notice('Synthetic cycle result could not be confirmed. Refresh demo and verify before retrying.', true);
+      try { await refreshSimulation(); } catch (_) {}
+    } finally { state.simulationRunning = false; renderSimulation(); renderStockSource(state.dashboard?.settings || {}, !!state.dashboard?.settings); }
   });
   function replaceTradeDraft() {
     const form = $('#trade-form');
@@ -457,15 +630,17 @@
     focusTradeForm('quantity');
   });
   $('#candidates-body').addEventListener('click', event => {
+    const demoButton = event.target.closest('[data-view-demo]');
+    if (demoButton && event.currentTarget.contains(demoButton)) { $('[data-page="ledger"]').click(); $('#simulation-panel').scrollIntoView({block:'start', behavior:'auto'}); return; }
     const button = event.target.closest('[data-use-quote]');
     if (!button || !event.currentTarget.contains(button)) return;
     const candidate = state.dashboard?.candidates?.[Number(button.dataset.useQuote)];
-    if (!candidate || candidate.asset_type !== 'stock' || !candidate.symbol || !present(candidate.price_usd) || Number(candidate.price_usd) <= 0) { notice('That stock quote is no longer available. Refresh and try again.', true); return; }
+    if (!candidate || candidate.asset_type !== 'stock' || isSimulation(candidate) || !candidate.symbol || !present(candidate.price_usd) || Number(candidate.price_usd) <= 0) { notice('That stock quote is no longer available for the shared ledger. Refresh and try again.', true); return; }
     if (!replaceTradeDraft()) return;
     const form = $('#trade-form');
     form.elements.symbol.value = candidate.symbol; form.elements.asset_type.value = 'stock'; form.elements.price.value = String(candidate.price_usd);
     const prefill = $('#quote-prefill');
-    prefill.textContent = `Prefilled ${candidate.symbol} from ${candidate.source || 'an unavailable source'}, ${candidate.cache_status === 'manual' ? 'user-supplied date' : 'trading day'} ${candidate.quote_date || 'unavailable'}. ${stockQuoteStatus(candidate)}. This quote may be delayed or stale${candidate.cache_status === 'manual' ? ' and is not independently verified' : ''}; verify it, then enter quantity and reason and submit manually.`;
+    prefill.textContent = `Prefilled ${candidate.symbol} from ${candidate.source || 'an unavailable source'}. ${stockQuoteTime(candidate)}. ${stockQuoteStatus(candidate)}. This quote may be delayed or stale${candidate.cache_status === 'manual' ? ' and is not independently verified' : ''}; verify it, then enter quantity and reason and submit manually.`;
     prefill.hidden = false;
     focusTradeForm('quantity');
   });
@@ -663,7 +838,7 @@
       $('#settings-user-message').hidden = isAdmin();
       $('#admin-settings').hidden = !isAdmin();
       $('#user-admin-panel').hidden = !isAdmin() || isLocalTestMode();
-      if (!isAdmin()) $('.market-copy p').textContent = 'Scanner and manual cycles use the administrator’s saved market selection and Alpha Vantage watchlist. Only administrators can change these settings or import Yahoo Finance quotes. Auto-paper cycles buy eligible crypto only; stocks are never bought or marked automatically. No background worker runs.';
+      if (!isAdmin()) $('.market-copy p').textContent = 'Scanner and manual cycles use the administrator’s saved market, stock source, provider and watchlist. Only administrators can change settings or import CSV quotes. Simulation uses fake prices. Auto-paper cycles buy eligible crypto only; stocks are never bought or marked automatically. No background worker runs.';
       if (isAdmin()) restoreScannerDrafts();
       renderDashboard({}); renderStockContext(); fillProvider(); restoreScanWarnings();
       $('#session-loading').hidden = true;

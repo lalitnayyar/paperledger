@@ -497,7 +497,7 @@ class AuthGuardMiddleware:
                 except (ValueError, TypeError):
                     await reject(403, "Invalid CSRF token.")
                     return
-                allowed_user = ((method == "POST" and path in ("/api/scan", "/api/cycle", "/api/trades", "/api/auth/logout"))
+                allowed_user = ((method == "POST" and path in ("/api/scan", "/api/cycle", "/api/trades", "/api/auth/logout", "/api/simulation/stocks/cycle"))
                                 or (method == "PATCH" and re.fullmatch(r"/api/positions/[0-9]+/mark", path)))
                 if session["role"] != "admin" and not allowed_user:
                     await reject(403, "Administrator access required.")

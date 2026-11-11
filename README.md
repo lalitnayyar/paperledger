@@ -40,9 +40,13 @@ The agent-flow panel is an illustrative visual guide, not an indication of activ
 
 ![Risk settings and stock watchlist and data-provider controls](docs/screenshots/settings.png)
 
-### Stocks and crypto scanner
+### Synthetic stock scanner
 
-![Stock and crypto scanner showing a time-specific market-data snapshot](docs/screenshots/scanner.png)
+![Stock scanner showing invented simulation prices, not market data](docs/screenshots/scanner.png)
+
+### Isolated synthetic stock simulator
+
+![Synthetic stock demo, with invented prices and a separate demo portfolio](docs/screenshots/stock-simulator.png)
 
 ### Light theme
 
@@ -54,7 +58,7 @@ The agent-flow panel is an illustrative visual guide, not an indication of activ
 - Values and fills in this application are simulations. They are not evidence of live execution, executable prices, exchange liquidity, realistic gas, taxes, market impact, or achievable returns.
 - The token scanner uses public DEX Screener market information. A recently published token profile is not necessarily a newly created token or pair. Public data can be delayed, incomplete, manipulated, rate-limited, or unavailable.
 - The liquidity and volume checks are **basic filters, not a smart-contract security audit**. They cannot detect every honeypot, malicious contract, token tax, or rug pull. A token passing the filters is not certified safe.
-- The stock scanner uses Alpha Vantage end-of-day quotes for a configurable watchlist of US-listed, USD-priced stocks. Quotes can be delayed or stale, do not verify liquidity or safety, and are not automatically used as position marks. Stock paper trades remain manual; there is no brokerage synchronization.
+- Stock data can come from Alpha Vantage, Finnhub, user-provided CSV quotes, or an explicitly selected offline simulation. API and CSV quotes can be delayed or stale, do not verify liquidity or safety, and are not automatically used as position marks. Simulation prices are synthetic, not market data. Stock paper trades remain manual; there is no brokerage synchronization. The separate demonstration portfolio is simulated and does not modify the normal paper ledger.
 - There is **no continuous trading worker**. The scanner and paper cycle run only when you click their buttons. Enabling automatic paper execution allows a manually triggered cycle to simulate up to three eligible **crypto** buys; stocks are not automatically bought. It does not schedule cycles. The scan-interval field is reserved for a future version. Stop-loss is only a sizing assumption and take-profit is advisory: neither automatically closes positions.
 - Manual buys have no mark until you enter one. Total equity and unrealized P&L are unavailable while any holding is unmarked; older chart points may still appear. Even a recorded mark can be stale. For crypto, symbols are not unique across chains and contracts; this simple ledger groups positions by symbol and asset type, so do not combine distinct tokens that share the same symbol.
 - AI provider responses are advisory and may be wrong. The six stages are programmatic workflow stages; they are not six independent autonomous LLMs. LLM responses cannot place live trades.
@@ -162,15 +166,26 @@ Afterward, `docker compose ps` should show `0.0.0.0:PORT->8000/tcp` for the IPv4
 
 ### Stocks, crypto, or both
 
-Use the market selector on the dashboard to choose **Stocks**, **Crypto**, or **Both**, select **Save selection**, then select **Run scanner**. The choice is saved. Crypto uses recently profiled DEX Screener tokens; its liquidity and volume checks are not a contract audit. Stock results come from a configurable list of US-listed, USD-priced symbols using Alpha Vantage's `GLOBAL_QUOTE` endpoint. A stock result includes its latest trading day and trading volume in shares, not token liquidity or 24-hour dollar volume.
+Use the market selector on the dashboard to choose **Stocks**, **Crypto**, or **Both**. Separately, choose the stock data source in Settings: **API**, **CSV**, **API + CSV**, or **Simulation**. Save your choices before running the scanner. The market selector controls which asset classes appear; the stock data source controls where stock quotes come from. Crypto uses recently profiled DEX Screener tokens; its liquidity and volume checks are not a contract audit.
 
-The default stock watchlist contains `IBM`, which can be tested with the provider's public demo key. To scan your own symbols, obtain an [Alpha Vantage API key](https://www.alphavantage.co/support/#api-key), add it in **Settings**, and edit the stock watchlist (up to 25 symbols). The service is rate-limited: each uncached symbol can use one API request, and Alpha Vantage currently documents 25 requests per day on its standard free tier for most datasets; check the provider for current limits and terms. If one source is unavailable in **Both** mode, review any warnings and the observation dates rather than assuming both scans succeeded.
+**API** requests up to 25 configured stock symbols from the selected API provider. Alpha Vantage uses one request per uncached symbol and documents [25 requests per day](https://www.alphavantage.co/support/) for most datasets on its free service; its `GLOBAL_QUOTE` data is end-of-day and can be older. With no Alpha Vantage key, its IBM demo is available. [Finnhub](https://finnhub.io/pricing) is an optional separate provider: its documented free plan is for personal use and currently allows 60 calls per minute. It requires its own key, uses one request per uncached symbol and may have other restrictions. Rates and terms can change. Neither provider is guaranteed to return data for every symbol or on every request.
 
-To reduce repeat calls, the app caches successful stock quotes for six hours and keeps older cached quotes if a later request fails. Cached results are labeled with their original fetch time and trading day. The cache cannot bypass an exhausted quota or a provider outage. If the provider reports a limit, wait for the provider's limit to reset before manually scanning again, or reduce the watchlist; the app does not retry in the background. A saved key does not prove that a provider accepted every request.
+API quotes are cached per provider to reduce repeat calls; Alpha Vantage quotes use a six-hour cache and Finnhub quotes use a five-minute cache. A recent fetch does not guarantee the underlying market price is recent. The UI retains the source, fetch time and available provider date or timestamp; quotes may be stale or unavailable. If a provider reports a quota, do not repeatedly scan. Check your account and retry when the provider permits, or use CSV or Simulation. Switching providers does not bypass either provider's limits. Removing symbols from the saved watchlist deletes their cached API quotes; adding them back later requires new requests.
 
-### Manually import Yahoo Finance quotes
+**CSV** uses manually imported quotes and makes no stock-provider requests. **API + CSV** displays both sets with their sources identified; a ticker may appear twice and the quotes are not combined. The CSV set remains available even if the API is limited. **Simulation** uses only artificial prices and no stock-provider requests. It is intended for exercising the workflow, not for market decisions. All modes work within the app's paper-only boundaries.
 
-In **Settings → Import Yahoo Finance quotes**, paste up to 25 stock quotes that you are authorized to use. The app does not automatically connect to Yahoo Finance: [Yahoo's terms](https://legal.yahoo.com/us/en/yahoo/terms/otos/index.html) restrict automated data collection without its prior express permission. Yahoo says its [market data](https://help.yahoo.com/kb/SLN2310.html) is informational, not intended for trading or investing, and must not be redistributed. Check the applicable terms before importing any data.
+For an existing Git installation, pull this release and rebuild the container:
+
+```bash
+git pull --ff-only
+bash fix-stock-scanner.sh
+```
+
+Run these commands from the project directory. The helper requires the existing regular `.env` file; it refuses to create or replace one. It delegates to `deploy.sh`, retains the existing port and bind configuration, and does not delete the data volume. Alternatively, `bash fix-stock-scanner.sh --update` pulls the configured upstream before rebuilding and requires a clean tracked working tree.
+
+### Manually import stock quotes from CSV
+
+In **Settings → Import stock quotes**, paste up to 25 stock quotes that you are authorized to use. No automatic CSV provider connection is made. If the source is Yahoo Finance, check [Yahoo's terms](https://legal.yahoo.com/us/en/yahoo/terms/otos/index.html) and [market-data restrictions](https://help.yahoo.com/kb/SLN2310.html) before importing or sharing its data.
 
 ![Manual stock quote import panel](docs/screenshots/manual-import.png)
 
@@ -182,9 +197,17 @@ AAPL,189.15,2026-11-06,100000
 MSFT,420.00,,
 ```
 
-Date and volume are optional. User-imported quotes are not independently verified and can be stale; the import time is not the quote time. Verify the price and any supplied date before using a quote. Imported quotes are displayed alongside scanner results in Stocks or Both mode, persist across scans and restarts, and never trigger stock buys or automatic marks. A new successful import replaces the previous imported set.
+Date and volume are optional. User-imported quotes are not independently verified and can be stale; the import time is not the quote time. Verify the price and any supplied date before using a quote. Imported quotes are displayed when the stock source is CSV or API + CSV and the market selector includes stocks. They persist across scans and restarts and never trigger stock buys or automatic marks. A new successful import replaces the previous imported set.
 
-Alpha Vantage's default quote is historical/end-of-day, **not a live price**. Market closures, provider updates, or network problems can make it older. Check the quote date before using it. A stock quote can prefill a manual paper order, but it is never submitted without your action and is not automatically used to buy or mark a stock holding. No scan runs in the background.
+Alpha Vantage's default quote is historical/end-of-day, **not a live price**. Other API or CSV quotes may also be delayed, incomplete or stale. Check the source and timestamps before use. An API or imported stock quote can prefill a manual paper order, but it is never submitted without your action and is not automatically used to buy or mark a stock holding. No scan runs in the background.
+
+### Offline synthetic stock demo
+
+In **Settings → Stock source**, select **Simulation only** and save. On the dashboard, choose **Stocks** and save, then select **Run scanner**. The tickers use invented prices generated locally from the watchlist; even recognizable ticker names do not imply real prices. Simulation mode does not use your stock API keys or imported CSV quotes.
+
+Open **Ledger → Synthetic stock simulator** and select **Run simulated stock cycle**. Each click advances one artificial step through a transparent rule-based momentum screen, position sizing, simulated execution, trade reasons, and equity tracking. It is not an AI prediction and does not run automatically. The demo starts with a separate $100,000 simulated balance and keeps its own positions and history; it does not change your normal paper cash, holdings, marks or trade history. The figures must not be used for real trading.
+
+The dedicated stock demo cycle is offline. If the dashboard's market selector also includes crypto, the ordinary scanner or ordinary crypto cycle can still contact DEX Screener and follow the existing crypto paper-trading rules. Select **Stocks** for a stock-only offline simulation.
 
 ### Local Ollama
 
@@ -268,6 +291,7 @@ bash tests/test_manage.sh
 bash tests/test_deploy.sh
 bash tests/test_fix_network.sh
 bash tests/test_fix_ledger.sh
+bash tests/test_fix_stock_scanner.sh
 ```
 
 The command above intentionally disables login **only for localhost development**. Never bind that mode to a network interface. Docker deployments always enable authentication. On Windows, activate with `.venv\Scripts\Activate.ps1` and set `$env:DATA_DIR = './data'`, `$env:APP_AUTH_ENABLED = '0'`, and `$env:APP_BIND_ADDR = '127.0.0.1'` for that development command. The Python tests exercise the ledger, scanner, providers, and authentication; the administration tests use mocked Docker and isolated local Git repositories, not a real Docker daemon. Optional holdings UI tests require Playwright and Chromium; without them pytest skips those tests. A real Docker build and restore should be verified on the target host before relying on them. If the scanner fails, check your internet connection, service availability and provider rate limits. No scan or AI result is invented if an upstream request fails. If Ollama fails, check its listening address, model name, and accessibility from inside Docker. If saved API keys stop decrypting, restore the original encryption key or clear and re-enter the credentials.
